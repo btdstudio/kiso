@@ -17,7 +17,7 @@ import (
 	"github.com/btdstudio/kiso/workspace"
 )
 
-// Schema is the STATE.json version this package writes.
+// Schema is the STATE.json version a Store writes unless it sets its own.
 const Schema = 1
 
 // Store persists changes for one tool at the workspace root: a committed
@@ -33,8 +33,12 @@ type Store struct {
 	Now func() time.Time
 	// Warn receives warnings. Optional; defaults to os.Stderr.
 	Warn io.Writer
-	// Migrate upgrades STATE.json bytes older than Schema. Optional. It should
-	// return bytes at the current schema.
+	// Schema is this tool's STATE.json version. A tool bumps it when its phases
+	// change, and upgrades older files in Migrate. Optional; defaults to the
+	// package's Schema.
+	Schema int
+	// Migrate upgrades STATE.json bytes older than the store's schema. Optional.
+	// It should return bytes at the current schema.
 	Migrate func(data []byte) ([]byte, error)
 	// Preflight runs before STATE.json is read, to refuse layouts the tool no
 	// longer supports. Optional.
@@ -47,6 +51,13 @@ type stateFile struct {
 }
 
 func (s Store) tool() string { return s.Machine.Tool }
+
+func (s Store) schema() int {
+	if s.Schema > 0 {
+		return s.Schema
+	}
+	return Schema
+}
 
 func (s Store) now() time.Time {
 	if s.Now != nil {
@@ -146,10 +157,10 @@ func (s Store) ReadChanges(root string) (map[string]*Change, error) {
 	if err := json.Unmarshal(data, &sf); err != nil {
 		return nil, fmt.Errorf("%s: cannot parse %s: %v", s.tool(), p, err)
 	}
-	if sf.Schema > Schema {
-		return nil, fmt.Errorf("%s: %s has schema %d, newer than this version supports (%d) — upgrade %s", s.tool(), p, sf.Schema, Schema, s.tool())
+	if sf.Schema > s.schema() {
+		return nil, fmt.Errorf("%s: %s has schema %d, newer than this version supports (%d) — upgrade %s", s.tool(), p, sf.Schema, s.schema(), s.tool())
 	}
-	if sf.Schema < Schema && s.Migrate != nil {
+	if sf.Schema < s.schema() && s.Migrate != nil {
 		upgraded, err := s.Migrate(data)
 		if err != nil {
 			return nil, fmt.Errorf("%s: cannot migrate %s: %v", s.tool(), p, err)
@@ -216,7 +227,7 @@ func (s Store) write(root string, c *Change) error {
 		c.Sources = []string{}
 	}
 	changes[c.Name] = c
-	buf, err := json.MarshalIndent(stateFile{Schema: Schema, Changes: changes}, "", "  ")
+	buf, err := json.MarshalIndent(stateFile{Schema: s.schema(), Changes: changes}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -378,7 +389,8 @@ func (s Store) active(root string) (Change, error) {
 }
 
 // Advance sets a gate on the active change, logs it along with any notes, and
-// commits. Enforcing the loop order is the caller's job, through CheckGate, since
+// commits, including the change's folder, so an approval can't be recorded while
+// the document it approved stays uncommitted. Enforcing the loop order is the caller's job, through CheckGate, since
 // whether a violation blocks is its policy.
 func (s Store) Advance(root, phase, status, reason string, notes ...string) (Change, error) {
 	c, err := s.active(root)
@@ -395,7 +407,7 @@ func (s Store) Advance(root, phase, status, reason string, notes ...string) (Cha
 	for _, note := range notes {
 		lines = append(lines, c.Name+": "+note)
 	}
-	return c, s.record(root, lines)
+	return c, s.record(root, lines, filepath.ToSlash(filepath.Join(s.SpecsDir, c.Name)))
 }
 
 // Reopen moves the active change back to a phase, logs it and commits.
@@ -475,11 +487,18 @@ func (s Store) commit(root, message string, paths []string) error {
 	if _, err := s.git(root, args...); err != nil {
 		return failed(err)
 	}
-	args = append([]string{"diff", "--cached", "--quiet", "--"}, paths...)
-	if _, err := s.git(root, args...); err == nil {
-		return nil // nothing changed
+	// `git commit --only` refuses a path git knows nothing about, such as an empty
+	// folder, so keep only the paths that have something to commit.
+	var changed []string
+	for _, p := range paths {
+		if _, err := s.git(root, "diff", "--cached", "--quiet", "--", p); err != nil {
+			changed = append(changed, p)
+		}
 	}
-	args = append([]string{"commit", "--quiet", "--only", "-m", message, "--"}, paths...)
+	if len(changed) == 0 {
+		return nil
+	}
+	args = append([]string{"commit", "--quiet", "--only", "-m", message, "--"}, changed...)
 	if _, err := s.git(root, args...); err != nil {
 		return failed(err)
 	}

@@ -311,6 +311,33 @@ func TestReadRefusesNewerSchemaAndCorruptFile(t *testing.T) {
 	}
 }
 
+func TestStoreSchemaOverridesDefault(t *testing.T) {
+	root, s := t.TempDir(), store()
+	s.Schema = 3
+	migrated := 0
+	s.Migrate = func(data []byte) ([]byte, error) {
+		migrated++
+		return []byte(`{"schema":3,"changes":{}}`), nil
+	}
+	if err := os.WriteFile(s.StatePath(root), []byte(`{"schema":2,"changes":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReadChanges(root); err != nil || migrated != 1 {
+		t.Fatalf("migrated = %d, err = %v", migrated, err)
+	}
+	if _, err := s.Seed(root, "1-x", SeedOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(s.StatePath(root))
+	if !strings.Contains(string(raw), `"schema": 3`) {
+		t.Fatalf("wrote:\n%s", raw)
+	}
+	s.Schema = 2
+	if _, err := s.ReadChanges(root); err == nil || !strings.Contains(err.Error(), "newer") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestPreflightRefuses(t *testing.T) {
 	s := store()
 	s.Preflight = func(string) error { return os.ErrPermission }
@@ -498,6 +525,57 @@ func TestTransitionsCommitStateAndLog(t *testing.T) {
 	}
 	if status := run(t, root, "status", "--porcelain"); status != "" {
 		t.Fatalf("tree not clean:\n%s", status)
+	}
+}
+
+func TestGateCommitsTheChangesFolder(t *testing.T) {
+	root, s := gitRepo(t)
+	if _, err := s.Seed(root, "1-x", SeedOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	spec := filepath.Join(root, "specs", "1-x", "requirements.md")
+	if err := os.WriteFile(spec, []byte("reqs\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "notes.md")
+	if err := os.WriteFile(outside, []byte("wip\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Advance(root, "intake", Approved, ""); err != nil {
+		t.Fatal(err)
+	}
+	files := run(t, root, "show", "--name-only", "--format=", "HEAD")
+	if !strings.Contains(files, "specs/1-x/requirements.md") || strings.Contains(files, "notes.md") {
+		t.Fatalf("commit has:\n%s", files)
+	}
+	if status := run(t, root, "status", "--porcelain"); !strings.Contains(status, "?? notes.md") {
+		t.Fatalf("status = %q", status)
+	}
+	// A deleted document is part of the record too.
+	if err := os.Remove(spec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Advance(root, "explore", Draft, ""); err != nil {
+		t.Fatal(err)
+	}
+	if files := run(t, root, "show", "--name-only", "--format=", "HEAD"); !strings.Contains(files, "specs/1-x/requirements.md") {
+		t.Fatalf("deletion not committed:\n%s", files)
+	}
+}
+
+func TestGateOnEmptyUntrackedFolderStillCommitsState(t *testing.T) {
+	root, s := gitRepo(t)
+	if err := os.MkdirAll(filepath.Join(root, "specs", "1-x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Switch(root, "1-x"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Advance(root, "intake", Approved, ""); err != nil {
+		t.Fatalf("empty folder broke the commit: %v", err)
+	}
+	if got := strings.TrimSpace(run(t, root, "log", "-1", "--format=%s")); got != "sample: 1-x: intake → approved" {
+		t.Fatalf("subject = %q", got)
 	}
 }
 
