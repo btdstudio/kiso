@@ -8,6 +8,7 @@ phases, folders or personas. Each tool passes in its own configuration.
 | Package | Purpose |
 |---|---|
 | `scaffold` | Copy an embedded file tree into a workspace, refresh it without overwriting user edits, and validate it |
+| `state` | A generic phase machine plus a committed `STATE.json` and `LOG.md` |
 | `settings` | Merge settings: defaults ← global (`~/.config/<tool>/`) ← project |
 | `workspace` | The local `.<tool>/` directory and the active-change pointer |
 | `changelog` | Append timestamped lines to a log file |
