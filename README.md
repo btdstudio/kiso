@@ -10,6 +10,8 @@ phases, folders or personas. Each tool passes in its own configuration.
 | `scaffold` | Copy an embedded file tree into a workspace, refresh it without overwriting user edits, and validate it |
 | `state` | A generic phase machine plus a committed `STATE.json` and `LOG.md` |
 | `repos` | A registry of logical repos: committed `REPOS.json`, local `.<tool>/paths.json`, and the `repo` and `env` commands |
+| `frontmatter` | Read and edit a controlled YAML subset at the top of a markdown file, keeping unchanged fields byte for byte |
+| `ticket` | Ticket schema v1: parse, validate, hash, freeze, dependency order |
 | `settings` | Merge settings: defaults ← global (`~/.config/<tool>/`) ← project |
 | `workspace` | The local `.<tool>/` directory and the active-change pointer |
 | `changelog` | Append timestamped lines to a log file |
