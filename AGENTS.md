@@ -17,6 +17,7 @@ This file applies to agents working on the kiso repo itself.
 ```
 scaffold/    embedded-FS scaffold engine: init, update, check, manifest hashes
 state/       generic phase machine, STATE.json store, commits on transitions
+repos/       logical repo registry + local paths, `repo` and `env` commands
 settings/    defaults ← global ← project merge
 workspace/   the local .<tool>/ directory and active-change pointer
 changelog/   append-only log writer

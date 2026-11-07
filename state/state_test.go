@@ -210,6 +210,28 @@ func TestSeedRecordsSkipsAndLogs(t *testing.T) {
 	}
 }
 
+func TestSeedRecordsRepos(t *testing.T) {
+	root, s := t.TempDir(), store()
+	if _, err := s.Seed(root, "1-x", SeedOptions{Repos: []string{"a", "b"}}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(c.Repos, []string{"a", "b"}) {
+		t.Fatalf("repos = %v", c.Repos)
+	}
+	raw, _ := os.ReadFile(s.StatePath(root))
+	if _, err := s.Seed(root, "2-y", SeedOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(s.StatePath(root))
+	if strings.Count(string(after), `"repos"`) != strings.Count(string(raw), `"repos"`) {
+		t.Fatalf("a change without repos wrote the key:\n%s", after)
+	}
+}
+
 func TestSeedRefusesBadNameAndUnskippablePhase(t *testing.T) {
 	root, s := t.TempDir(), store()
 	if _, err := s.Seed(root, "../evil", SeedOptions{}); err == nil || !strings.Contains(err.Error(), "invalid change name") {
