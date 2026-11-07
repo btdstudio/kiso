@@ -563,6 +563,46 @@ func TestGateCommitsTheChangesFolder(t *testing.T) {
 	}
 }
 
+func TestGateCommitsChangeDirsWhenPresent(t *testing.T) {
+	root, s := gitRepo(t)
+	s.ChangeDirs = []string{"research", "explore"}
+	if _, err := s.Seed(root, "1-x", SeedOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "research", "1-x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "research", "1-x", "notes.md"), []byte("n\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Advance(root, "intake", Approved, ""); err != nil {
+		t.Fatal(err)
+	}
+	if files := run(t, root, "show", "--name-only", "--format=", "HEAD"); !strings.Contains(files, "research/1-x/notes.md") {
+		t.Fatalf("commit has:\n%s", files)
+	}
+}
+
+func TestRecordCommitsExtraPaths(t *testing.T) {
+	root, s := gitRepo(t)
+	if _, err := s.Seed(root, "1-x", SeedOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "ticket.md"), []byte("t\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Record(root, []string{"first", "second"}, "ticket.md"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(run(t, root, "log", "-1", "--format=%s")); got != "sample: first" {
+		t.Fatalf("subject = %q", got)
+	}
+	files := run(t, root, "show", "--name-only", "--format=", "HEAD")
+	if !strings.Contains(files, "ticket.md") || !strings.Contains(files, "LOG.md") {
+		t.Fatalf("commit has:\n%s", files)
+	}
+}
+
 func TestGateOnEmptyUntrackedFolderStillCommitsState(t *testing.T) {
 	root, s := gitRepo(t)
 	if err := os.MkdirAll(filepath.Join(root, "specs", "1-x"), 0o755); err != nil {

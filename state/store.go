@@ -26,6 +26,9 @@ const Schema = 1
 type Store struct {
 	Machine  Machine
 	SpecsDir string // change folders, relative to the workspace root
+	// ChangeDirs are other folders holding a <dir>/<change>/ per change, relative
+	// to the workspace root. Gates commit these along with the change's folder.
+	ChangeDirs []string
 	// Commit makes each transition commit STATE.json and LOG.md, so an approval
 	// can't sit uncommitted.
 	Commit bool
@@ -361,7 +364,7 @@ func (s Store) Seed(root, name string, opts SeedOptions) (Change, error) {
 		return Change{}, err
 	}
 	paths := append([]string{filepath.ToSlash(filepath.Join(s.SpecsDir, name, ".gitkeep"))}, opts.Paths...)
-	return c, s.record(root, lines, paths...)
+	return c, s.Record(root, lines, paths...)
 }
 
 func transitionLine(name, phase, status, reason string) string {
@@ -407,7 +410,13 @@ func (s Store) Advance(root, phase, status, reason string, notes ...string) (Cha
 	for _, note := range notes {
 		lines = append(lines, c.Name+": "+note)
 	}
-	return c, s.record(root, lines, filepath.ToSlash(filepath.Join(s.SpecsDir, c.Name)))
+	paths := []string{filepath.ToSlash(filepath.Join(s.SpecsDir, c.Name))}
+	for _, dir := range s.ChangeDirs {
+		if _, err := os.Stat(filepath.Join(root, dir, c.Name)); err == nil {
+			paths = append(paths, filepath.ToSlash(filepath.Join(dir, c.Name)))
+		}
+	}
+	return c, s.Record(root, lines, paths...)
 }
 
 // Reopen moves the active change back to a phase, logs it and commits.
@@ -422,7 +431,7 @@ func (s Store) Reopen(root, phase, reason string) (Change, error) {
 	if err := s.Save(root, &c); err != nil {
 		return Change{}, err
 	}
-	return c, s.record(root, []string{c.Name + ": reopened " + phase + " (" + reason + ")"})
+	return c, s.Record(root, []string{c.Name + ": reopened " + phase + " (" + reason + ")"})
 }
 
 // CloseChange closes a change by name, logs it and commits. Closing the active
@@ -451,7 +460,7 @@ func (s Store) CloseChange(root, name, reason string) (Change, error) {
 			return Change{}, err
 		}
 	}
-	return c, s.record(root, []string{name + ": closed (" + reason + ")"})
+	return c, s.Record(root, []string{name + ": closed (" + reason + ")"})
 }
 
 // Log appends one timestamped line to LOG.md without committing.
@@ -459,8 +468,9 @@ func (s Store) Log(root, line string) error {
 	return changelog.Append(s.LogPath(root), s.now(), line)
 }
 
-// record logs a transition and commits it.
-func (s Store) record(root string, lines []string, paths ...string) error {
+// Record logs lines and, when Commit is on, commits them with STATE.json and any
+// extra paths, relative to root. The first line becomes the commit subject.
+func (s Store) Record(root string, lines []string, paths ...string) error {
 	for _, line := range lines {
 		if err := s.Log(root, line); err != nil {
 			return err
