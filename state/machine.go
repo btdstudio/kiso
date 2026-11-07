@@ -48,7 +48,8 @@ type Change struct {
 	Status    string            `json:"status"`
 	Gates     map[string]string `json:"gates"`
 	Sources   []string          `json:"sources"`
-	UpdatedAt string            `json:"updatedAt"` // per change, so branches touching different changes merge
+	Repos     []string          `json:"repos,omitempty"` // logical names from REPOS.json
+	UpdatedAt string            `json:"updatedAt"`       // per change, so branches touching different changes merge
 }
 
 // IsClosed reports whether the change has been closed.

@@ -301,6 +301,8 @@ func (s Store) Switch(root, name string) (Change, error) {
 // SeedOptions configure Seed.
 type SeedOptions struct {
 	Sources []string
+	// Repos are logical repo names this change works on.
+	Repos []string
 	// Skip maps skippable phases to the reason they don't apply to this change.
 	Skip map[string]string
 	// Paths are extra files to commit with the new change, relative to root, such
@@ -321,6 +323,7 @@ func (s Store) Seed(root, name string, opts SeedOptions) (Change, error) {
 	if opts.Sources != nil {
 		c.Sources = opts.Sources
 	}
+	c.Repos = opts.Repos
 	first := s.Machine.Phases[0].Name
 	lines := []string{name + ": created"}
 	for _, p := range s.Machine.Phases {
