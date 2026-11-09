@@ -18,3 +18,19 @@ phases, folders or personas. Each tool passes in its own configuration.
 | `version` | Report the running binary's version from build info |
 
 Runtime: Go >= 1.22, standard library only.
+
+## Core settings
+
+kiso validates one setting itself, for every tool: `vcs`, which says whether a
+workspace lives in git. Like any setting, the project value supersedes the global
+one.
+
+| Value | Meaning |
+|---|---|
+| `git` (default) | Transitions commit `STATE.json` and `LOG.md`. `init` runs `git init`. Git files are scaffolded. |
+| `none` | The workspace is plain local files. Transitions never run git or warn. `init` skips `git init`, records `"vcs": "none"` in the project settings, and leaves out `.gitignore`, `.gitattributes` and `.gitkeep`, while still creating their folders. `update` neither writes nor reports git files, and drops them from the manifest without deleting them from disk. |
+
+Any other value fails `settings.Load`. `Loaded.VCS` holds the effective value. A
+tool passes it to `state.Store.VCS` and `scaffold.Engine.VCS`. When a tool adopts
+a kiso version with `vcs`, it should wire both fields in the same change, because
+the "not in a git repo" warning now suggests setting `"vcs": "none"`.

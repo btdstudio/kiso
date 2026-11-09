@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -703,5 +704,180 @@ func TestSlugifyAndNextID(t *testing.T) {
 	}
 	if s.NextID(root) != 8 {
 		t.Errorf("NextID = %d", s.NextID(root))
+	}
+}
+
+func TestOutsideGitWarningHintsAtVCSNone(t *testing.T) {
+	root, s := t.TempDir(), store()
+	s.Commit = true
+	s.VCS = "git"
+	warnings := &bytes.Buffer{}
+	s.Warn = warnings
+	if _, err := s.Seed(root, "1-x", SeedOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	want := `this state change was not committed; set "vcs": "none" if this workspace is meant to be local` + "\n"
+	if !strings.HasSuffix(warnings.String(), want) {
+		t.Fatalf("warnings = %q", warnings)
+	}
+}
+
+func TestVCSNoneInsideRepoCommitsAndStagesNothing(t *testing.T) {
+	root, s := gitRepo(t)
+	s.VCS = "none"
+	if _, err := s.Seed(root, "1-x", SeedOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Advance(root, "intake", AwaitApproval, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(run(t, root, "log", "-1", "--format=%s")); got != "init" {
+		t.Fatalf("unexpected commit: %q", got)
+	}
+	if staged := strings.TrimSpace(run(t, root, "diff", "--cached", "--name-only")); staged != "" {
+		t.Fatalf("staged: %q", staged)
+	}
+}
+
+func TestVCSNoneSeedSkipsGitkeep(t *testing.T) {
+	root, s := t.TempDir(), store()
+	s.VCS = "none"
+	if _, err := s.Seed(root, "1-x", SeedOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(filepath.Join(root, "specs", "1-x")); err != nil || !info.IsDir() {
+		t.Fatalf("change folder: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "specs", "1-x", ".gitkeep")); !os.IsNotExist(err) {
+		t.Fatalf(".gitkeep exists or err = %v", err)
+	}
+}
+
+func TestInvalidVCSIsAnError(t *testing.T) {
+	root, s := t.TempDir(), store()
+	s.VCS = "svn"
+	if _, err := s.Seed(root, "1-x", SeedOptions{}); err == nil || !strings.Contains(err.Error(), `invalid vcs "svn"`) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "specs", "1-x")); !os.IsNotExist(err) {
+		t.Fatalf("change folder created despite invalid vcs: %v", err)
+	}
+}
+
+// fakeGit puts a `git` that records each call into a marker file alone on PATH,
+// and returns the marker's path. The marker exists only if git was run.
+func fakeGit(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake git needs /bin/sh")
+	}
+	bin := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "git-calls")
+	script := "#!/bin/sh\necho \"$@\" >> '" + marker + "'\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	return marker
+}
+
+func TestVCSNoneRunsNoGitAndWarnsNothing(t *testing.T) {
+	marker := fakeGit(t)
+	root, s := t.TempDir(), store()
+	s.Commit = true
+	s.VCS = "none"
+	warnings := &bytes.Buffer{}
+	s.Warn = warnings
+	if _, err := s.Seed(root, "1-x", SeedOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Advance(root, "intake", Approved, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reopen(root, "intake", "redo"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CloseChange(root, "1-x", "done"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		calls, _ := os.ReadFile(marker)
+		t.Fatalf("git was run: %q", calls)
+	}
+	if warnings.Len() != 0 {
+		t.Fatalf("warnings = %q", warnings)
+	}
+	log, err := os.ReadFile(s.LogPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"1-x: created", "intake → approved", "reopened intake (redo)", "1-x: closed (done)"} {
+		if !strings.Contains(string(log), want) {
+			t.Fatalf("LOG.md missing %q:\n%s", want, log)
+		}
+	}
+	if _, err := os.Stat(s.StatePath(root)); err != nil {
+		t.Fatalf("STATE.json: %v", err)
+	}
+}
+
+func TestFakeGitDetectsCommits(t *testing.T) {
+	marker := fakeGit(t)
+	root, s := t.TempDir(), store()
+	s.Commit = true
+	if _, err := s.Seed(root, "1-x", SeedOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("fake git was not called under the default vcs: %v", err)
+	}
+}
+
+// AC5: every transition kind inside a repo, with extra paths, commits and stages
+// nothing under vcs none.
+func TestVCSNoneInsideRepoAllTransitionsLeaveGitUntouched(t *testing.T) {
+	root, s := gitRepo(t)
+	s.VCS = "none"
+	s.ChangeDirs = []string{"00_intake"}
+	if err := os.MkdirAll(filepath.Join(root, "00_intake", "1-x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "00_intake", "1-x", "n.md"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Seed(root, "1-x", SeedOptions{Paths: []string{"00_intake/1-x/n.md"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Advance(root, "intake", Approved, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Reopen(root, "intake", "redo"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CloseChange(root, "1-x", "done"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Record(root, []string{"1-x: note"}, "00_intake/1-x/n.md"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(run(t, root, "rev-list", "--count", "HEAD")); got != "1" {
+		t.Fatalf("commits = %s, want 1", got)
+	}
+	if staged := strings.TrimSpace(run(t, root, "diff", "--cached", "--name-only")); staged != "" {
+		t.Fatalf("staged: %q", staged)
+	}
+}
+
+// R4/AC6 hold for an unset vcs too, since unset means git.
+func TestOutsideGitWarningHintsWhenVCSUnset(t *testing.T) {
+	root, s := t.TempDir(), store()
+	s.Commit = true
+	warnings := &bytes.Buffer{}
+	s.Warn = warnings
+	if _, err := s.Seed(root, "1-x", SeedOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(warnings.String(), `set "vcs": "none" if this workspace is meant to be local`) {
+		t.Fatalf("warnings = %q", warnings)
 	}
 }

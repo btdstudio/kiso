@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/btdstudio/kiso/changelog"
+	"github.com/btdstudio/kiso/settings"
 	"github.com/btdstudio/kiso/workspace"
 )
 
@@ -32,6 +33,10 @@ type Store struct {
 	// Commit makes each transition commit STATE.json and LOG.md, so an approval
 	// can't sit uncommitted.
 	Commit bool
+	// VCS is the workspace's core "vcs" setting. "" and settings.VCSGit keep the
+	// behavior above; settings.VCSNone means the workspace is plain local files:
+	// transitions never run git, never warn, and change folders get no .gitkeep.
+	VCS string
 	// Now is the clock for timestamps. Optional; defaults to time.Now.
 	Now func() time.Time
 	// Warn receives warnings. Optional; defaults to os.Stderr.
@@ -74,6 +79,20 @@ func (s Store) warn() io.Writer {
 		return s.Warn
 	}
 	return os.Stderr
+}
+
+// local reports whether the workspace is declared local (vcs: none).
+func (s Store) local() bool { return s.VCS == settings.VCSNone }
+
+// commits reports whether transitions commit: Commit is on and the workspace is
+// not local.
+func (s Store) commits() bool { return s.Commit && !s.local() }
+
+func (s Store) checkVCS() error {
+	if s.VCS == "" {
+		return nil
+	}
+	return settings.CheckVCS(s.tool(), s.VCS)
 }
 
 func stamp(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z") }
@@ -330,6 +349,9 @@ func (s Store) Seed(root, name string, opts SeedOptions) (Change, error) {
 	if !changeNameRe.MatchString(name) {
 		return Change{}, fmt.Errorf("%s: invalid change name %q", s.tool(), name)
 	}
+	if err := s.checkVCS(); err != nil {
+		return Change{}, err
+	}
 	if len(s.Machine.Phases) == 0 {
 		return Change{}, fmt.Errorf("%s: machine has no phases", s.tool())
 	}
@@ -355,15 +377,19 @@ func (s Store) Seed(root, name string, opts SeedOptions) (Change, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return Change{}, err
 	}
-	// Git drops empty folders, and a clone needs this one to switch to the change.
-	keep := filepath.Join(dir, ".gitkeep")
-	if err := os.WriteFile(keep, nil, 0o644); err != nil {
-		return Change{}, err
+	var paths []string
+	if !s.local() {
+		// Git drops empty folders, and a clone needs this one to switch to the change.
+		keep := filepath.Join(dir, ".gitkeep")
+		if err := os.WriteFile(keep, nil, 0o644); err != nil {
+			return Change{}, err
+		}
+		paths = append(paths, filepath.ToSlash(filepath.Join(s.SpecsDir, name, ".gitkeep")))
 	}
 	if err := s.Save(root, &c); err != nil {
 		return Change{}, err
 	}
-	paths := append([]string{filepath.ToSlash(filepath.Join(s.SpecsDir, name, ".gitkeep"))}, opts.Paths...)
+	paths = append(paths, opts.Paths...)
 	return c, s.Record(root, lines, paths...)
 }
 
@@ -468,15 +494,19 @@ func (s Store) Log(root, line string) error {
 	return changelog.Append(s.LogPath(root), s.now(), line)
 }
 
-// Record logs lines and, when Commit is on, commits them with STATE.json and any
-// extra paths, relative to root. The first line becomes the commit subject.
+// Record logs lines and, when Commit is on and VCS is not none, commits them with
+// STATE.json and any extra paths, relative to root. The first line becomes the
+// commit subject.
 func (s Store) Record(root string, lines []string, paths ...string) error {
+	if err := s.checkVCS(); err != nil {
+		return err
+	}
 	for _, line := range lines {
 		if err := s.Log(root, line); err != nil {
 			return err
 		}
 	}
-	if !s.Commit {
+	if !s.commits() {
 		return nil
 	}
 	return s.commit(root, s.tool()+": "+lines[0], append([]string{"STATE.json", "LOG.md"}, paths...))
@@ -487,7 +517,7 @@ func (s Store) Record(root string, lines []string, paths ...string) error {
 // a failed commit is an error, because the state on disk is now ahead of git.
 func (s Store) commit(root, message string, paths []string) error {
 	if _, err := s.git(root, "rev-parse", "--is-inside-work-tree"); err != nil {
-		fmt.Fprintf(s.warn(), "warning: %s is not in a git repo — this state change was not committed\n", root)
+		fmt.Fprintf(s.warn(), "warning: %s is not in a git repo — this state change was not committed; set \"vcs\": \"none\" if this workspace is meant to be local\n", root)
 		return nil
 	}
 	failed := func(err error) error {
