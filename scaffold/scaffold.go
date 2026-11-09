@@ -34,20 +34,31 @@ type Engine struct {
 	// such as settings and state. Optional.
 	Seeds func() ([]Seed, error)
 	// VCS is the workspace's core "vcs" setting. "" and settings.VCSGit scaffold
-	// the whole tree. settings.VCSNone leaves out the git files (see IsGitFile)
-	// everywhere: init and update don't write, record or report them, and init
-	// doesn't run `git init` and records "vcs": "none" in the project settings.
+	// the whole tree. settings.VCSNone leaves out .gitattributes and .gitkeep
+	// everywhere (init and update don't write, record or report them) but keeps
+	// .gitignore, and init doesn't run `git init` and records "vcs": "none" in
+	// the project settings.
 	VCS string
 }
 
 // IsGitFile reports whether rel, a slash-separated path, is a git file: a
-// .gitignore, .gitattributes or .gitkeep at any depth.
+// .gitignore, .gitattributes or .gitkeep at any depth. A local workspace (VCS
+// none) leaves out every git file except .gitignore, which it keeps so that
+// machine-local files such as .<tool>/active and .<tool>/paths.json stay out of
+// an enclosing git repo, or of one created later.
 func IsGitFile(rel string) bool {
 	switch path.Base(rel) {
 	case ".gitignore", ".gitattributes", ".gitkeep":
 		return true
 	}
 	return false
+}
+
+// omitWhenLocal reports whether a local workspace (vcs: none) leaves rel out:
+// every git file except .gitignore, which still keeps .<tool>/active and
+// .<tool>/paths.json out of an enclosing or later git repo.
+func omitWhenLocal(rel string) bool {
+	return IsGitFile(rel) && path.Base(rel) != ".gitignore"
 }
 
 func (e Engine) local() bool { return e.VCS == settings.VCSNone }
@@ -104,8 +115,8 @@ func (e Engine) walk(fn func(rel string, data []byte) error) error {
 		if path.Base(p) == ".DS_Store" {
 			return nil
 		}
-		// A local workspace has no git files.
-		if e.local() && IsGitFile(p) {
+		// A local workspace leaves out git files, except .gitignore.
+		if e.local() && omitWhenLocal(p) {
 			return nil
 		}
 		data, err := fs.ReadFile(e.FS, p)

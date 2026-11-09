@@ -2,6 +2,7 @@ package scaffold
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -246,7 +247,26 @@ func fakeGit(t *testing.T) string {
 	return marker
 }
 
-var gitFiles = []string{".gitignore", "00_intake/.gitkeep"}
+// omittedFiles are the test tree's git files that a local workspace leaves out.
+// Its .gitignore is kept (see omitWhenLocal).
+var omittedFiles = []string{"00_intake/.gitkeep"}
+
+// realGit skips unless git is on PATH, and isolates it from the developer's
+// global and system config and from git's default excludes file
+// ($XDG_CONFIG_HOME/git/ignore, or ~/.config/git/ignore), so nothing user-level
+// can hide files from `git status`. HOME and XDG_CONFIG_HOME also cover git
+// versions older than 2.32, which ignore GIT_CONFIG_GLOBAL.
+func realGit(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+}
 
 func TestIsGitFile(t *testing.T) {
 	for rel, want := range map[string]bool{
@@ -267,15 +287,18 @@ func TestIsGitFile(t *testing.T) {
 	}
 }
 
-func TestManifestUnderVCSNoneHasNoGitFiles(t *testing.T) {
+func TestManifestUnderVCSNoneKeepsOnlyGitignore(t *testing.T) {
 	m, err := localEngine().BuildManifest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, rel := range gitFiles {
+	for _, rel := range omittedFiles {
 		if _, ok := m.Files[rel]; ok {
 			t.Errorf("manifest lists %s", rel)
 		}
+	}
+	if _, ok := m.Files[".gitignore"]; !ok {
+		t.Error("manifest lost .gitignore")
 	}
 	if _, ok := m.Files["AGENTS.md"]; !ok {
 		t.Error("manifest lost AGENTS.md")
@@ -308,15 +331,21 @@ func TestScaffoldLocalWorkspace(t *testing.T) {
 		calls, _ := os.ReadFile(marker)
 		t.Fatalf("git was run: %q", calls)
 	}
-	for _, rel := range append([]string{".git", ".gitattributes"}, gitFiles...) {
+	for _, rel := range append([]string{".git", ".gitattributes"}, omittedFiles...) {
 		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(rel))); !os.IsNotExist(err) {
 			t.Errorf("%s exists or err = %v", rel, err)
 		}
 	}
 	for _, rel := range rep.Written {
-		if IsGitFile(rel) {
+		if omitWhenLocal(rel) {
 			t.Errorf("reported git file %s", rel)
 		}
+	}
+	if got := read(t, filepath.Join(dir, ".gitignore")); got != ".sample/active\n" {
+		t.Errorf(".gitignore = %q", got)
+	}
+	if !slices.Contains(rep.Written, ".gitignore") {
+		t.Errorf(".gitignore not in Written: %v", rep.Written)
 	}
 	if info, err := os.Stat(filepath.Join(dir, "00_intake")); err != nil || !info.IsDir() {
 		t.Errorf("00_intake missing: %v", err)
@@ -329,9 +358,12 @@ func TestScaffoldLocalWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	for rel := range m.Files {
-		if IsGitFile(rel) {
+		if omitWhenLocal(rel) {
 			t.Errorf("manifest lists %s", rel)
 		}
+	}
+	if _, ok := m.Files[".gitignore"]; !ok {
+		t.Error("manifest missing .gitignore")
 	}
 }
 
@@ -391,7 +423,7 @@ func TestInvalidVCSIsAnError(t *testing.T) {
 	}
 }
 
-func TestUpdateLocalWritesAndReportsNoGitFiles(t *testing.T) {
+func TestUpdateLocalOmitsGitFilesButGitignore(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := localEngine().Scaffold(dir, Options{}); err != nil {
 		t.Fatal(err)
@@ -405,12 +437,15 @@ func TestUpdateLocalWritesAndReportsNoGitFiles(t *testing.T) {
 	}
 	for _, list := range [][]string{rep.Updated, rep.Skipped, rep.Unchanged} {
 		for _, rel := range list {
-			if IsGitFile(rel) {
+			if omitWhenLocal(rel) {
 				t.Errorf("reported git file %s: %+v", rel, rep)
 			}
 		}
 	}
-	for _, rel := range gitFiles {
+	if !slices.Contains(rep.Unchanged, ".gitignore") {
+		t.Errorf(".gitignore not Unchanged: %+v", rep)
+	}
+	for _, rel := range omittedFiles {
 		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(rel))); !os.IsNotExist(err) {
 			t.Errorf("%s created or err = %v", rel, err)
 		}
@@ -423,30 +458,43 @@ func TestUpdateLocalWritesAndReportsNoGitFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	for rel := range m.Files {
-		if IsGitFile(rel) {
+		if omitWhenLocal(rel) {
 			t.Errorf("manifest lists %s", rel)
 		}
+	}
+	if _, ok := m.Files[".gitignore"]; !ok {
+		t.Error("manifest missing .gitignore")
 	}
 }
 
 func TestUpdateSwitchToNoneLeavesGitFilesOnDisk(t *testing.T) {
 	dir := scaffoldDir(t)
 	write(t, filepath.Join(dir, ".gitignore"), "edited\n")
+	all := append([]string{".gitignore"}, omittedFiles...)
 	before := map[string]string{}
-	for _, rel := range gitFiles {
+	for _, rel := range all {
 		before[rel] = read(t, filepath.Join(dir, filepath.FromSlash(rel)))
 	}
-	if _, err := localEngine().Update(dir); err != nil {
+	rep, err := localEngine().Update(dir)
+	if err != nil {
 		t.Fatal(err)
 	}
 	m, err := localEngine().ReadManifest(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, rel := range gitFiles {
+	for _, rel := range omittedFiles {
 		if _, ok := m.Files[rel]; ok {
 			t.Errorf("manifest still lists %s", rel)
 		}
+	}
+	if _, ok := m.Files[".gitignore"]; !ok {
+		t.Error("manifest dropped .gitignore")
+	}
+	if !slices.Contains(rep.Skipped, ".gitignore") {
+		t.Errorf("edited .gitignore not Skipped: %+v", rep)
+	}
+	for _, rel := range all {
 		if got := read(t, filepath.Join(dir, filepath.FromSlash(rel))); got != before[rel] {
 			t.Errorf("%s changed: %q, want %q", rel, got, before[rel])
 		}
@@ -466,20 +514,19 @@ func TestUpdateSwitchToGitRestoresGitFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, rel := range gitFiles {
+	for _, rel := range omittedFiles {
 		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(rel))); err != nil {
 			t.Errorf("%s not restored: %v", rel, err)
 		}
 		if _, ok := m.Files[rel]; !ok {
 			t.Errorf("manifest missing %s", rel)
 		}
-		found := false
-		for _, u := range rep.Updated {
-			found = found || u == rel
-		}
-		if !found {
+		if !slices.Contains(rep.Updated, rel) {
 			t.Errorf("%s not in Updated: %v", rel, rep.Updated)
 		}
+	}
+	if _, ok := m.Files[".gitignore"]; !ok || !slices.Contains(rep.Unchanged, ".gitignore") {
+		t.Errorf(".gitignore should stay managed and Unchanged: %+v", rep)
 	}
 }
 
@@ -499,16 +546,33 @@ func richEngine(vcs string) Engine {
 	return e
 }
 
-// AC8: every git file kind, at any depth, is left out; their folders exist.
+// .gitattributes and .gitkeep, at any depth, are left out and their folders
+// exist; every .gitignore is kept, written, reported and recorded.
 func TestScaffoldLocalOmitsEveryGitFileKind(t *testing.T) {
 	fakeGit(t)
 	dir := t.TempDir()
-	if _, err := richEngine("none").Scaffold(dir, Options{}); err != nil {
+	rep, err := richEngine("none").Scaffold(dir, Options{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, rel := range []string{".gitignore", ".gitattributes", "00_intake/.gitkeep", "a/b/.gitkeep", "docs/.gitignore"} {
+	m, err := richEngine("none").ReadManifest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{".gitattributes", "00_intake/.gitkeep", "a/b/.gitkeep"} {
 		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(rel))); !os.IsNotExist(err) {
 			t.Errorf("%s exists or err = %v", rel, err)
+		}
+		if _, ok := m.Files[rel]; ok || slices.Contains(rep.Written, rel) {
+			t.Errorf("%s recorded or reported", rel)
+		}
+	}
+	for _, rel := range []string{".gitignore", "docs/.gitignore"} {
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(rel))); err != nil {
+			t.Errorf("%s missing: %v", rel, err)
+		}
+		if _, ok := m.Files[rel]; !ok || !slices.Contains(rep.Written, rel) {
+			t.Errorf("%s not recorded and reported: %v", rel, rep.Written)
 		}
 	}
 	for _, d := range []string{"00_intake", "a/b", "docs"} {
@@ -609,5 +673,210 @@ func TestScaffoldLocalRefusesTrailingData(t *testing.T) {
 	write(t, filepath.Join(dir, ".sample", "settings.json"), "{} x\n")
 	if _, err := localEngine().Scaffold(dir, Options{}); err == nil || !strings.Contains(err.Error(), "cannot parse settings") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// v070LocalDir scaffolds a local workspace the v0.7.0 way: no .gitignore on disk
+// or in the manifest.
+func v070LocalDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	e := localEngine()
+	if _, err := e.Scaffold(dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, ".gitignore")); err != nil {
+		t.Fatal(err)
+	}
+	m, err := e.ReadManifest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(m.Files, ".gitignore")
+	if err := e.WriteManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// AC2: updating a v0.7.0 local workspace writes and records .gitignore, and
+// still leaves the other git files out.
+func TestUpdateLocalAddsGitignoreToV070Workspace(t *testing.T) {
+	dir := v070LocalDir(t)
+	rep, err := localEngine().Update(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(dir, ".gitignore")); got != ".sample/active\n" {
+		t.Errorf(".gitignore = %q", got)
+	}
+	if !slices.Contains(rep.Updated, ".gitignore") {
+		t.Errorf(".gitignore not Updated: %+v", rep)
+	}
+	m, err := localEngine().ReadManifest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Files[".gitignore"]; !ok {
+		t.Error("manifest missing .gitignore")
+	}
+	for _, rel := range omittedFiles {
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(rel))); !os.IsNotExist(err) {
+			t.Errorf("%s written or err = %v", rel, err)
+		}
+	}
+}
+
+// AC3, N4: an edited .gitignore is skipped, never overwritten.
+func TestUpdateLocalSkipsEditedGitignore(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := localEngine().Scaffold(dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, ".gitignore"), "mine\n")
+	rep, err := localEngine().Update(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(dir, ".gitignore")); got != "mine\n" {
+		t.Errorf(".gitignore overwritten: %q", got)
+	}
+	if !slices.Contains(rep.Skipped, ".gitignore") {
+		t.Errorf(".gitignore not Skipped: %+v", rep)
+	}
+}
+
+// AC4: a deleted .gitignore is restored with the tree's contents.
+func TestUpdateLocalRestoresDeletedGitignore(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := localEngine().Scaffold(dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, ".gitignore")); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := localEngine().Update(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(dir, ".gitignore")); got != ".sample/active\n" {
+		t.Errorf(".gitignore = %q", got)
+	}
+	if !slices.Contains(rep.Updated, ".gitignore") {
+		t.Errorf(".gitignore not Updated: %+v", rep)
+	}
+}
+
+// N4: a user's own .gitignore, never recorded, is skipped when a v0.7.0 local
+// workspace is updated.
+func TestUpdateLocalSkipsUnrecordedUserGitignore(t *testing.T) {
+	dir := v070LocalDir(t)
+	write(t, filepath.Join(dir, ".gitignore"), "my own rules\n")
+	rep, err := localEngine().Update(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(dir, ".gitignore")); got != "my own rules\n" {
+		t.Errorf("user .gitignore overwritten: %q", got)
+	}
+	if !slices.Contains(rep.Skipped, ".gitignore") {
+		t.Errorf(".gitignore not Skipped: %+v", rep)
+	}
+}
+
+// AC9: inside an enclosing git repo, a local workspace's machine-local files are
+// ignored by its .gitignore.
+func TestLocalWorkspaceInsideRepoIgnoresLocalFiles(t *testing.T) {
+	realGit(t)
+	parent := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = parent
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return string(out)
+	}
+	git("init", "-q")
+	e := localEngine()
+	e.FS = fstest.MapFS{
+		"AGENTS.md":          {Data: []byte("agents\n")},
+		".gitignore":         {Data: []byte(".sample/active\n.sample/paths.json\n")},
+		"00_intake/.gitkeep": {Data: nil},
+	}
+	ws := filepath.Join(parent, "ws")
+	if _, err := e.Scaffold(ws, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(ws, ".sample", "active"), "1-x\n")
+	write(t, filepath.Join(ws, ".sample", "paths.json"), "{\"kiso\": \"/home/someone/src/kiso\"}\n")
+	status := git("status", "--porcelain", "--untracked-files=all")
+	for _, rel := range []string{"ws/.sample/active", "ws/.sample/paths.json"} {
+		if strings.Contains(status, rel) {
+			t.Errorf("%s is not ignored:\n%s", rel, status)
+		}
+	}
+	if !strings.Contains(status, "ws/AGENTS.md") {
+		t.Errorf("control: ws/AGENTS.md not listed:\n%s", status)
+	}
+}
+
+// Goal, case 2: the user runs `git init` in a local workspace before any
+// update; its .gitignore already keeps the machine-local files out.
+func TestLocalWorkspaceGitInitBeforeUpdateIgnoresLocalFiles(t *testing.T) {
+	realGit(t)
+	e := localEngine()
+	e.FS = fstest.MapFS{
+		"AGENTS.md":  {Data: []byte("agents\n")},
+		".gitignore": {Data: []byte(".sample/active\n.sample/paths.json\n")},
+	}
+	ws := t.TempDir()
+	if _, err := e.Scaffold(ws, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(ws, ".sample", "active"), "1-x\n")
+	write(t, filepath.Join(ws, ".sample", "paths.json"), "{}\n")
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = ws
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return string(out)
+	}
+	git("init", "-q")
+	status := git("status", "--porcelain", "--untracked-files=all")
+	for _, rel := range []string{".sample/active", ".sample/paths.json"} {
+		if strings.Contains(status, rel) {
+			t.Errorf("%s is not ignored:\n%s", rel, status)
+		}
+	}
+	if !strings.Contains(status, "AGENTS.md") {
+		t.Errorf("control: AGENTS.md not listed:\n%s", status)
+	}
+}
+
+// AC5, unedited: switching git → none keeps an unedited .gitignore managed and
+// reports it as unchanged.
+func TestUpdateSwitchToNoneKeepsUneditedGitignoreManaged(t *testing.T) {
+	dir := scaffoldDir(t)
+	before := read(t, filepath.Join(dir, ".gitignore"))
+	rep, err := localEngine().Update(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := localEngine().ReadManifest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Files[".gitignore"]; !ok || !slices.Contains(rep.Unchanged, ".gitignore") {
+		t.Errorf(".gitignore should stay managed and Unchanged: %+v", rep)
+	}
+	if got := read(t, filepath.Join(dir, ".gitignore")); got != before {
+		t.Errorf(".gitignore changed: %q", got)
 	}
 }
