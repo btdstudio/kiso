@@ -38,6 +38,10 @@ type Phase struct {
 type Machine struct {
 	Tool   string // prefixes order violations
 	Phases []Phase
+	// Check validates a phase's artifacts before a transition to status. It's
+	// optional. CheckArtifacts runs it; Advance and SetGate never do, so the
+	// caller decides when to check and what a problem means.
+	Check func(root, change, phase, status string) []Problem
 }
 
 // Change is one change's progress through the machine. Gates holds only phases
