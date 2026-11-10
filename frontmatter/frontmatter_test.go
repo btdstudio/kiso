@@ -226,3 +226,37 @@ func TestErrorsNameTheLine(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestFields(t *testing.T) {
+	d := parse(t, sample)
+	want := []Field{
+		{Key: "schema", Kind: Scalar, Value: "1"},
+		{Key: "id", Kind: Scalar, Value: "S-0014"},
+		{Key: "title", Kind: Scalar, Value: "Add: release workflow"},
+		{Key: "depends_on", Kind: List, Items: []string{"S-0011", "S-0012"}},
+		{Key: "labels", Kind: List, Items: []string{}},
+		{Key: "external", Kind: Map, Subs: map[string]string{"ado": "48213", "github": "org/repo#7"}},
+		{Key: "quoted", Kind: Scalar, Value: "it's fine"},
+		{Key: "empty", Kind: Scalar, Value: ""},
+	}
+	got := d.Fields()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Fields()\n got %#v\nwant %#v", got, want)
+	}
+
+	// The result is a copy: changing it leaves the document alone.
+	before := string(d.Bytes())
+	got[3].Items[0] = "X-9999"
+	got[5].Subs["ado"] = "1"
+	got[5].Subs["jira"] = "J-1"
+	if string(d.Bytes()) != before {
+		t.Fatal("changing Fields() changed the document")
+	}
+	if again := d.Fields(); !reflect.DeepEqual(again, want) {
+		t.Fatalf("second Fields() = %#v", again)
+	}
+
+	if fields := New("body").Fields(); len(fields) != 0 {
+		t.Fatalf("empty document has fields %#v", fields)
+	}
+}

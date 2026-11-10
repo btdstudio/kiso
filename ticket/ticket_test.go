@@ -315,17 +315,26 @@ func TestPublishFreezeDriftUnfreeze(t *testing.T) {
 	if !drifted.Drifted() || !strings.Contains(messages(ValidateFile(drifted)), "drifted") {
 		t.Fatalf("drift not flagged: %s", messages(ValidateFile(drifted)))
 	}
+	if !strings.Contains(messages(ValidateFile(drifted)), "drifted: body changed since") {
+		t.Fatalf("drift message: %s", messages(ValidateFile(drifted)))
+	}
 	if err := drifted.MarkPublished("jira", "X-1"); err == nil || !strings.Contains(err.Error(), "changed since") {
 		t.Fatalf("err = %v", err)
 	}
 
-	// Frontmatter edits aren't drift: the PM tool owns status after publish.
+	// Frontmatter edits are drift too: the freeze covers the frontmatter.
 	retagged, err := Parse([]byte(strings.Replace(string(frozen.Bytes()), "labels: []", "labels: [late]", 1)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if retagged.Drifted() {
-		t.Fatal("a frontmatter edit counted as drift")
+	if !retagged.Drifted() {
+		t.Fatal("a labels edit didn't count as drift")
+	}
+	if !strings.Contains(messages(ValidateFile(retagged)), "drifted: frontmatter changed since") {
+		t.Fatalf("drift message: %s", messages(ValidateFile(retagged)))
+	}
+	if err := retagged.MarkPublished("jira", "X-1"); err == nil || !strings.Contains(err.Error(), "frontmatter changed since") {
+		t.Fatalf("err = %v", err)
 	}
 
 	// Unfreeze keeps the ids, passes validation, and can be republished.
@@ -410,5 +419,421 @@ func TestLoadDir(t *testing.T) {
 	}
 	if tickets, problems, err := LoadDir(filepath.Join(dir, "missing")); err != nil || tickets != nil || problems != nil {
 		t.Fatalf("missing dir = %v, %v, %v", tickets, problems, err)
+	}
+}
+
+// freezeFixture is a ready ticket with every kind of field, including an
+// unknown key and a map that the freeze covers.
+const freezeFixture = "---\nschema: 1\nid: S-0001\ntype: story\ntitle: A ticket\nparent: F-0001\nrepo: a\n" +
+	"depends_on: [S-0002, S-0003]\nlabels: [x, y]\nx: keep\nmeta:\n  k: v\nstatus: ready\n---\n" + readyBody
+
+// frozenText publishes text and returns the frozen file.
+func frozenText(t *testing.T, text string) string {
+	t.Helper()
+	tk, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tk.MarkPublished("ado", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(tk.PublishedHash, "v2:") {
+		t.Fatalf("published_hash = %q", tk.PublishedHash)
+	}
+	return string(tk.Bytes())
+}
+
+// setLine replaces the line starting with prefix.
+func setLine(t *testing.T, text, prefix, line string) string {
+	t.Helper()
+	i := strings.Index(text, "\n"+prefix)
+	if i < 0 {
+		t.Fatalf("no line %q in:\n%s", prefix, text)
+	}
+	end := strings.Index(text[i+1:], "\n") + i + 1
+	return text[:i+1] + line + text[end:]
+}
+
+type driftCase struct {
+	name   string
+	edit   func(string) string
+	body   bool
+	fm     bool
+	expect string // a substring of the ValidateFile messages; "" means none
+}
+
+func checkDrift(t *testing.T, frozen string, cases []driftCase) {
+	t.Helper()
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			edited := c.edit(frozen)
+			if edited == frozen {
+				t.Fatal("the edit changed nothing")
+			}
+			tk, err := Parse([]byte(edited))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, fm := tk.Drift()
+			if body != c.body || fm != c.fm {
+				t.Fatalf("Drift() = (%v, %v), want (%v, %v)\n%s", body, fm, c.body, c.fm, edited)
+			}
+			if tk.Drifted() != (c.body || c.fm) {
+				t.Fatalf("Drifted() = %v", tk.Drifted())
+			}
+			got := messages(ValidateFile(tk))
+			if c.expect == "" && strings.Contains(got, "drifted") {
+				t.Fatalf("unexpected drift: %s", got)
+			}
+			if c.expect != "" && !strings.Contains(got, c.expect) {
+				t.Fatalf("messages = %q, want %q", got, c.expect)
+			}
+		})
+	}
+}
+
+func replace(old, new string) func(string) string {
+	return func(s string) string { return strings.Replace(s, old, new, 1) }
+}
+
+func TestFreezeCoversFrontmatter(t *testing.T) {
+	const fmDrift = "drifted: frontmatter changed since it was published"
+	checkDrift(t, frozenText(t, freezeFixture), []driftCase{
+		{"title", replace("title: A ticket", "title: B ticket"), false, true, fmDrift},
+		{"parent", replace("parent: F-0001", "parent: F-0009"), false, true, fmDrift},
+		{"depends_on", replace("[S-0002, S-0003]", "[S-0002]"), false, true, fmDrift},
+		{"repo", replace("repo: a\n", "repo: b\n"), false, true, fmDrift},
+		{"labels", replace("labels: [x, y]", "labels: [x, z]"), false, true, fmDrift},
+		{"unknown key", replace("x: keep", "x: changed"), false, true, fmDrift},
+		{"new key", replace("x: keep\n", "x: keep\nestimate: S\n"), false, true, fmDrift},
+		{"map value", replace("  k: v\n", "  k: w\n"), false, true, fmDrift},
+		{"body and frontmatter", func(s string) string {
+			return strings.Replace(strings.Replace(s, "title: A ticket", "title: B", 1), "AC1", "AC9", 1)
+		}, true, true, "drifted: body and frontmatter changed since it was published"},
+	})
+}
+
+func TestFreezeIgnoresFieldsWrittenAfterIt(t *testing.T) {
+	withMarks := strings.Replace(freezeFixture, "id: S-0001\n", "id: S-0001\nready_hash: v2:old\norigin:\n  workspace: w\n  path: p\n", 1)
+	checkDrift(t, frozenText(t, freezeFixture), []driftCase{
+		{"status changed", replace("status: published", "status: ready"), false, false, ""},
+		{"status removed", replace("status: published\n", ""), false, false, ""},
+		{"second external id", replace("  ado: 1\n", "  ado: 1\n  github: org/repo#7\n"), false, false, ""},
+		{"origin added", replace("id: S-0001\n", "id: S-0001\norigin:\n  workspace: w\n  path: p\n"), false, false, ""},
+		{"ready_hash added", replace("id: S-0001\n", "id: S-0001\nready_hash: v2:any\n"), false, false, ""},
+	})
+	checkDrift(t, frozenText(t, withMarks), []driftCase{
+		{"ready_hash changed", replace("ready_hash: v2:old", "ready_hash: v2:new"), false, false, ""},
+		{"ready_hash removed", replace("ready_hash: v2:old\n", ""), false, false, ""},
+		{"origin changed", replace("  workspace: w\n", "  workspace: other\n"), false, false, ""},
+		{"origin removed", replace("origin:\n  workspace: w\n  path: p\n", ""), false, false, ""},
+	})
+}
+
+func TestFreezeIgnoresFormatting(t *testing.T) {
+	frozen := frozenText(t, freezeFixture)
+	checkDrift(t, frozen, []driftCase{
+		{"reordered", func(s string) string {
+			s = strings.Replace(s, "title: A ticket\n", "", 1)
+			return strings.Replace(s, "x: keep\n", "x: keep\ntitle: A ticket\n", 1)
+		}, false, false, ""},
+		{"double quoted", replace("title: A ticket", `title: "A ticket"`), false, false, ""},
+		{"single quoted", replace("repo: a\n", "repo: 'a'\n"), false, false, ""},
+		{"list spacing", replace("[S-0002, S-0003]", "[ S-0002 ,S-0003 ]"), false, false, ""},
+		{"list order", replace("[S-0002, S-0003]", "[S-0003, S-0002]"), false, false, ""},
+		{"inline comment", replace("x: keep", "x: keep   # a note"), false, false, ""},
+		{"comment line", replace("schema: 1\n", "schema: 1\n# a comment\n"), false, false, ""},
+		{"quoted schema", replace("schema: 1\n", "schema: \"1\"\n"), false, false, ""},
+		{"crlf", func(s string) string { return strings.ReplaceAll(s, "\n", "\r\n") }, false, false, ""},
+		{"trailing newlines", func(s string) string { return s + "\n\n\n" }, false, false, ""},
+	})
+}
+
+func TestFreezeSkipsAbsentFields(t *testing.T) {
+	checkDrift(t, frozenText(t, freezeFixture), []driftCase{
+		{"empty list", replace("x: keep\n", "x: keep\nrequirements: []\n"), false, false, ""},
+		{"empty scalar", replace("x: keep\n", "x: keep\nestimate: \"\"\n"), false, false, ""},
+		{"key without a value", replace("x: keep\n", "x: keep\nsupersedes:\n"), false, false, ""},
+		{"empty map entry", replace("  k: v\n", "  k: v\n  blank: \"\"\n"), false, false, ""},
+		{"map of empty values", replace("x: keep\n", "x: keep\nextra:\n  a: \"\"\n"), false, false, ""},
+	})
+}
+
+func TestMalformedV2FreezeIsReported(t *testing.T) {
+	frozen := frozenText(t, freezeFixture)
+	parsed, err := Parse([]byte(frozen))
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := parsed.PublishedHash
+	for name, value := range map[string]string{
+		"short":          "v2:abc",
+		"uppercase hex":  "v2:" + strings.ToUpper(good[3:]),
+		"missing a half": good[:3+32],
+		"extra half":     good + ".00",
+	} {
+		t.Run(name, func(t *testing.T) {
+			tk, err := Parse([]byte(setLine(t, frozen, "published_hash:", "published_hash: \""+value+"\"")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tk.Drifted() {
+				t.Fatal("a malformed freeze didn't count as drift")
+			}
+			got := messages(ValidateFile(tk))
+			if !strings.Contains(got, "isn't a valid v2 hash") || strings.Contains(got, "drifted") {
+				t.Fatalf("messages = %q", got)
+			}
+			err = tk.MarkPublished("ado", "1")
+			if err == nil {
+				t.Fatal("MarkPublished accepted a malformed freeze")
+			}
+			if !strings.Contains(err.Error(), "isn't a valid v2 hash") || strings.Contains(err.Error(), "changed since") {
+				t.Fatalf("MarkPublished error = %v", err)
+			}
+			// Unfreezing clears it, and the ticket can be re-frozen.
+			if err := tk.Unfreeze(); err != nil {
+				t.Fatal(err)
+			}
+			if err := tk.MarkPublished("ado", "1"); err != nil || tk.PublishedHash != ContentHash(tk) {
+				t.Fatalf("re-freeze: err = %v, published_hash = %q", err, tk.PublishedHash)
+			}
+		})
+	}
+}
+
+func TestLegacyBodyOnlyFreeze(t *testing.T) {
+	body := readyBody
+	legacy := "---\nschema: 1\nid: S-0001\ntype: story\ntitle: A ticket\nrepo: a\nlabels: [x]\nstatus: published\n" +
+		"external:\n  ado: 1\npublished_hash: " + Hash(body) + "\n---\n" + body
+	tk, err := Parse([]byte(legacy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if problems := ValidateFile(tk); len(problems) != 0 {
+		t.Fatalf("problems:\n%s", messages(problems))
+	}
+	if b, f := tk.Drift(); b || f {
+		t.Fatalf("Drift() = (%v, %v)", b, f)
+	}
+	checkDrift(t, legacy, []driftCase{
+		{"body edit", replace("AC1", "AC9"), true, false, "drifted: body changed since it was published"},
+		{"title edit", replace("title: A ticket", "title: B ticket"), false, false, ""},
+		{"labels edit", replace("labels: [x]", "labels: [x, late]"), false, false, ""},
+	})
+
+	// Unfreeze and republish writes the v2 freeze.
+	if err := tk.Unfreeze(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tk.MarkPublished("ado", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(tk.PublishedHash, "v2:") || tk.PublishedHash != ContentHash(tk) {
+		t.Fatalf("published_hash = %q, ContentHash = %q", tk.PublishedHash, ContentHash(tk))
+	}
+
+	// Publishing an undrifted legacy ticket to a second tool upgrades it too.
+	second, err := Parse([]byte(legacy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.MarkPublished("github", "org/repo#7"); err != nil {
+		t.Fatal(err)
+	}
+	if second.PublishedHash != ContentHash(second) {
+		t.Fatalf("published_hash = %q", second.PublishedHash)
+	}
+
+	// Publishing a v2 ticket again leaves its freeze as it was.
+	again, err := Parse(second.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := again.MarkPublished("ado", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if again.PublishedHash != second.PublishedHash {
+		t.Fatalf("republish changed the freeze: %q -> %q", second.PublishedHash, again.PublishedHash)
+	}
+}
+
+// TestContentHashIsPinned fixes the canonical form. If this fails, the hash of
+// every v2 freeze changed: that needs a new prefix, not a new literal.
+func TestContentHashIsPinned(t *testing.T) {
+	const text = "---\nschema: 1\nid: S-0042\ntype: story\ntitle: \"Say \\\"hi\\\" <now> & then\"\nrepo: kiso\n" +
+		"depends_on: [S-0002, S-0001]\nlabels: []\nzeta: unknown\nmeta:\n  b: 2\n  a: 1\nstatus: published\n" +
+		"external:\n  ado: 7\norigin:\n  workspace: w\n  path: p\nready_hash: v2:x\npublished_hash: \"v2:y\"\n---\nbody text\n"
+	tk, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Checked by hand: the sha256 of "body text\n" and of this text, each cut
+	// to 32 hex characters (shasum -a 256).
+	const canonical = `depends_on=["S-0001","S-0002"]
+id="S-0042"
+meta={"a":"1","b":"2"}
+repo="kiso"
+schema="1"
+title="Say \"hi\" \u003cnow\u003e \u0026 then"
+type="story"
+zeta="unknown"
+`
+	if got := canonicalFrontmatter(tk.doc); got != canonical {
+		t.Fatalf("canonical frontmatter:\n%s\nwant:\n%s", got, canonical)
+	}
+	const want = "v2:044bbaad51900e452b203079800e84aa.14f77507924d080a4363e45918b15b41"
+	if got := ContentHash(tk); got != want {
+		t.Fatalf("ContentHash = %s, want %s", got, want)
+	}
+}
+
+func TestKeysSortByNameNotByLine(t *testing.T) {
+	tk, err := Parse([]byte("---\na: 1\na-b: 2\na1: 3\n---\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "a=\"1\"\na-b=\"2\"\na1=\"3\"\n"
+	if got := canonicalFrontmatter(tk.doc); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestHashIsUnchanged(t *testing.T) {
+	// The legacy hash of v0.8.0, so old freezes keep validating.
+	if got := Hash("a\r\nb"); got != "911169ddaaf146aff539f58c26c489af3b892dff0fe283c1c264c65ae5aa59a2" {
+		t.Fatalf("Hash = %s", got)
+	}
+}
+
+// QA: cases the implement tests don't cover.
+
+func TestQAHashLeavesTheDocumentAlone(t *testing.T) {
+	tk, err := Parse([]byte(freezeFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk2, err := Parse([]byte(strings.Replace(freezeFixture, "[S-0002, S-0003]", "[S-0003, S-0002]", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := string(tk2.Bytes())
+	if ContentHash(tk) != ContentHash(tk2) {
+		t.Fatal("list order changed the hash")
+	}
+	if string(tk2.Bytes()) != before || strings.Join(tk2.doc.List("depends_on"), ",") != "S-0003,S-0002" {
+		t.Fatal("ContentHash changed the document")
+	}
+}
+
+func TestQAFreezeSurvivesRoundTrips(t *testing.T) {
+	frozen := frozenText(t, freezeFixture)
+	tk, err := Parse([]byte(frozen))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Parse, render and parse again: still the same freeze, no drift.
+	again, err := Parse(tk.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Drifted() || ContentHash(again) != tk.PublishedHash {
+		t.Fatalf("round trip drifted: %q vs %q", ContentHash(again), tk.PublishedHash)
+	}
+	// A ticket built with New and published validates cleanly.
+	built := mk(t, Ticket{ID: "S-0009", Status: StatusReady, Body: readyBody, DependsOn: []string{"S-0002", "S-0001"}, Labels: []string{"b", "a"}})
+	if err := built.MarkPublished("ado", "9"); err != nil {
+		t.Fatal(err)
+	}
+	reparsed, err := Parse(built.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if problems := ValidateFile(reparsed); len(problems) != 0 {
+		t.Fatalf("problems:\n%s", messages(problems))
+	}
+}
+
+func TestQAMalformedHalves(t *testing.T) {
+	frozen := frozenText(t, freezeFixture)
+	parsed, err := Parse([]byte(frozen))
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := parsed.PublishedHash
+	b, f, _ := strings.Cut(good[3:], ".")
+	for name, value := range map[string]string{
+		"33-character half": "v2:" + b + "." + f + "0",
+		"31-character half": "v2:" + b[:31] + "." + f,
+		"non-hex character": "v2:" + b[:31] + "g." + f,
+		"no separator":      "v2:" + b + f,
+		"prefix only":       "v2:",
+		"uppercase prefix":  "V2:" + b + "." + f,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tk, err := Parse([]byte(setLine(t, frozen, "published_hash:", "published_hash: \""+value+"\"")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tk.Drifted() {
+				t.Fatal("not drifted")
+			}
+			got := messages(ValidateFile(tk))
+			// "V2:" isn't the v2 prefix, so it's a legacy hash that doesn't match.
+			want := "isn't a valid v2 hash"
+			if strings.HasPrefix(value, "V2:") {
+				want = "drifted: body changed"
+			}
+			if !strings.Contains(got, want) {
+				t.Fatalf("messages = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// Security #1: JSON can't tell invalid UTF-8 bytes apart, so two values that
+// differ only in them would hash the same. ValidateFile refuses them instead.
+func TestInvalidUTF8FrontmatterIsReported(t *testing.T) {
+	head := "---\nschema: 1\nid: S-0001\ntype: story\nrepo: a\nstatus: draft\n"
+	for name, c := range map[string]struct{ fm, key string }{
+		"scalar":    {"title: x\xffy\n", "title"},
+		"list item": {"title: x\nlabels: [ok, b\xfe]\n", "labels"},
+		"map value": {"title: x\nmeta:\n  k: v\xff\n", "meta"},
+		"map key":   {"title: x\nmeta:\n  k\xff: v\n", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tk, err := Parse([]byte(head + c.fm + "---\nbody\n"))
+			if c.key == "" {
+				// Keys must match the parser's key pattern, so an invalid byte
+				// in one is rejected before it reaches the hash.
+				if err == nil {
+					t.Fatal("parser accepted a key with an invalid byte")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "frontmatter field " + c.key + " isn't valid UTF-8"
+			if got := messages(ValidateFile(tk)); !strings.Contains(got, want) {
+				t.Fatalf("messages = %q, want %q", got, want)
+			}
+		})
+	}
+
+	// Valid non-ASCII text is fine.
+	ok, err := Parse([]byte(head + "title: café — naïve\nlabels: [日本]\n---\nbody\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := messages(ValidateFile(ok)); strings.Contains(got, "UTF-8") {
+		t.Fatalf("valid UTF-8 reported: %s", got)
+	}
+
+	// The case the check exists for: the two values hash the same.
+	a, _ := Parse([]byte(head + "title: x\xffy\n---\nb\n"))
+	b, _ := Parse([]byte(head + "title: x\xfey\n---\nb\n"))
+	if ContentHash(a) != ContentHash(b) {
+		t.Fatal("the collision this check guards against is gone; revisit the check")
 	}
 }
