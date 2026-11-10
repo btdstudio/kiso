@@ -20,6 +20,7 @@ state/       generic phase machine, STATE.json store, commits on transitions
 repos/       logical repo registry + local paths, `repo` and `env` commands
 frontmatter/ controlled YAML-subset parser/writer
 ticket/      ticket schema v1: parse, validate, hash, freeze, dependency order
+placeholder/ template placeholder detection in markdown, outside code
 settings/    defaults ← global ← project merge
 workspace/   the local .<tool>/ directory and active-change pointer
 changelog/   append-only log writer

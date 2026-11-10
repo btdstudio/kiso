@@ -12,6 +12,7 @@ phases, folders or personas. Each tool passes in its own configuration.
 | `repos` | A registry of logical repos: committed `REPOS.json`, local `.<tool>/paths.json`, and the `repo` and `env` commands |
 | `frontmatter` | Read and edit a controlled YAML subset at the top of a markdown file, keeping unchanged fields byte for byte |
 | `ticket` | Ticket schema v1: parse, validate, hash, freeze, dependency order |
+| `placeholder` | Find template placeholders (`<…>` and `...` slots) in markdown, outside code |
 | `settings` | Merge settings: defaults ← global (`~/.config/<tool>/`) ← project |
 | `workspace` | The local `.<tool>/` directory and the active-change pointer |
 | `changelog` | Append timestamped lines to a log file |
