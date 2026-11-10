@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -55,6 +56,12 @@ func mk(t *testing.T, f Ticket) *Ticket {
 	tk, err := New(f)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if f.Status == StatusReady {
+		// A ready ticket carries a readiness mark, as one readied through the CLI does.
+		if err := tk.MarkReady(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return tk
 }
@@ -522,7 +529,10 @@ func TestFreezeIgnoresFieldsWrittenAfterIt(t *testing.T) {
 		{"origin added", replace("id: S-0001\n", "id: S-0001\norigin:\n  workspace: w\n  path: p\n"), false, false, ""},
 		{"ready_hash added", replace("id: S-0001\n", "id: S-0001\nready_hash: v2:any\n"), false, false, ""},
 	})
-	checkDrift(t, frozenText(t, withMarks), []driftCase{
+	// MarkPublished removes ready_hash, so put one back by hand: a stray mark on
+	// a published ticket still mustn't count as drift.
+	frozenWithMarks := strings.Replace(frozenText(t, withMarks), "id: S-0001\n", "id: S-0001\nready_hash: v2:old\n", 1)
+	checkDrift(t, frozenWithMarks, []driftCase{
 		{"ready_hash changed", replace("ready_hash: v2:old", "ready_hash: v2:new"), false, false, ""},
 		{"ready_hash removed", replace("ready_hash: v2:old\n", ""), false, false, ""},
 		{"origin changed", replace("  workspace: w\n", "  workspace: other\n"), false, false, ""},
@@ -835,5 +845,317 @@ func TestInvalidUTF8FrontmatterIsReported(t *testing.T) {
 	b, _ := Parse([]byte(head + "title: x\xfey\n---\nb\n"))
 	if ContentHash(a) != ContentHash(b) {
 		t.Fatal("the collision this check guards against is gone; revisit the check")
+	}
+}
+
+// draftText is a draft story with the given acceptance criteria lines.
+func draftText(criteria string) string {
+	return "---\nschema: 1\nid: S-0001\ntype: story\ntitle: A ticket\nrepo: a\nlabels: [x]\nstatus: draft\n---\n" +
+		"\n## Context\nWhy.\n\n## Acceptance criteria\n" + criteria + "\n## Notes\nNone.\n"
+}
+
+func parseText(t *testing.T, text string) *Ticket {
+	t.Helper()
+	tk, err := Parse([]byte(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tk
+}
+
+func noToolNames(t *testing.T, s string) {
+	t.Helper()
+	if lower := strings.ToLower(s); strings.Contains(lower, "zumen") || strings.Contains(lower, "tomo") {
+		t.Fatalf("message names a tool: %s", s)
+	}
+}
+
+func TestMarkReady(t *testing.T) {
+	draft := draftText("- [ ] AC1: Given a repo When a tag lands Then a release is cut\n")
+	tk := parseText(t, draft)
+	if err := tk.MarkReady(); err != nil {
+		t.Fatal(err)
+	}
+	if tk.Status != StatusReady || tk.ReadyHash == "" || tk.ReadyHash != ContentHash(tk) {
+		t.Fatalf("status = %q, ready_hash = %q, ContentHash = %q", tk.Status, tk.ReadyHash, ContentHash(tk))
+	}
+	if problems := ValidateFile(tk); len(problems) != 0 {
+		t.Fatalf("problems:\n%s", messages(problems))
+	}
+	// Byte-stable: only the status line changes and ready_hash is added.
+	got := string(tk.Bytes())
+	want := strings.Replace(draft, "status: draft\n", "status: ready\nready_hash: "+strconvQuote(tk.ReadyHash)+"\n", 1)
+	if got != want {
+		t.Fatalf("bytes:\n%s\nwant:\n%s", got, want)
+	}
+	// It survives a round trip.
+	again := parseText(t, got)
+	if again.ReadyHash != tk.ReadyHash {
+		t.Fatalf("round trip: %q", again.ReadyHash)
+	}
+	if problems := ValidateFile(again); len(problems) != 0 {
+		t.Fatalf("problems after round trip:\n%s", messages(problems))
+	}
+}
+
+// strconvQuote renders a value the way the frontmatter writer does: v2 values
+// contain ":", so they're double-quoted.
+func strconvQuote(s string) string { return `"` + s + `"` }
+
+func TestReadinessIsValidated(t *testing.T) {
+	ready := parseText(t, draftText("- [ ] AC1: Given x When y Then z\n"))
+	if err := ready.MarkReady(); err != nil {
+		t.Fatal(err)
+	}
+	readyText := string(ready.Bytes())
+
+	cases := []struct {
+		name string
+		text string
+		want string // "" means no readiness problem
+	}{
+		{"set to ready by hand", strings.Replace(draftText("- [ ] AC1: Given x When y Then z\n"), "status: draft", "status: ready", 1),
+			"not readied through the CLI"},
+		{"body edited", strings.Replace(readyText, "Why.", "Why not.", 1), "body changed since readied"},
+		{"title edited", strings.Replace(readyText, "title: A ticket", "title: Another", 1), "frontmatter changed since readied"},
+		{"labels edited", strings.Replace(readyText, "labels: [x]", "labels: [x, y]", 1), "frontmatter changed since readied"},
+		{"both edited", strings.Replace(strings.Replace(readyText, "Why.", "Why not.", 1), "title: A ticket", "title: B", 1),
+			"body and frontmatter changed since readied"},
+		{"malformed mark", setLine(t, readyText, "ready_hash:", `ready_hash: "v2:abc"`), `ready_hash "v2:abc" isn't a valid v2 hash`},
+		{"external added", strings.Replace(readyText, "labels: [x]\n", "labels: [x]\nexternal:\n  ado: 1\n", 1), ""},
+		{"origin added", strings.Replace(readyText, "labels: [x]\n", "labels: [x]\norigin:\n  workspace: w\n  path: p\n", 1), ""},
+		{"untouched", readyText, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := messages(ValidateFile(parseText(t, c.text)))
+			noToolNames(t, got)
+			if c.want == "" {
+				if strings.Contains(got, "readied") || strings.Contains(got, "ready_hash") {
+					t.Fatalf("unexpected readiness problem: %s", got)
+				}
+				return
+			}
+			if !strings.Contains(got, c.want) {
+				t.Fatalf("messages = %q, want %q", got, c.want)
+			}
+		})
+	}
+
+	// Readying again after an edit refreshes the mark.
+	edited := parseText(t, strings.Replace(readyText, "Why.", "Why not.", 1))
+	if err := edited.MarkReady(); err != nil {
+		t.Fatal(err)
+	}
+	if problems := ValidateFile(parseText(t, string(edited.Bytes()))); len(problems) != 0 {
+		t.Fatalf("problems after re-readying:\n%s", messages(problems))
+	}
+
+	// A stale mark on a draft isn't an error.
+	stale := strings.Replace(strings.Replace(readyText, "status: ready", "status: draft", 1), "Why.", "Why not.", 1)
+	if problems := ValidateFile(parseText(t, stale)); len(problems) != 0 {
+		t.Fatalf("draft with a stale mark:\n%s", messages(problems))
+	}
+}
+
+func TestMarkReadyRefusesOtherStatuses(t *testing.T) {
+	published := parseText(t, draftText("- [ ] AC1: Given x When y Then z\n"))
+	if err := published.MarkPublished("ado", "1"); err != nil {
+		t.Fatal(err)
+	}
+	closed := mk(t, Ticket{ID: "N-0001", Type: Task, Status: StatusClosed})
+	for name, tk := range map[string]*Ticket{"published": published, "closed": closed} {
+		t.Run(name, func(t *testing.T) {
+			before := string(tk.Bytes())
+			err := tk.MarkReady()
+			if err == nil || !strings.Contains(err.Error(), "only a draft or ready ticket can be readied") {
+				t.Fatalf("err = %v", err)
+			}
+			if string(tk.Bytes()) != before {
+				t.Fatal("a refused MarkReady changed the ticket")
+			}
+		})
+	}
+}
+
+func TestMarkPublishedRemovesTheReadinessMark(t *testing.T) {
+	tk := parseText(t, draftText("- [ ] AC1: Given x When y Then z\n"))
+	if err := tk.MarkReady(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tk.MarkPublished("ado", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if tk.ReadyHash != "" || strings.Contains(string(tk.Bytes()), "ready_hash") {
+		t.Fatalf("ready_hash kept:\n%s", tk.Bytes())
+	}
+	again := parseText(t, string(tk.Bytes()))
+	if problems := ValidateFile(again); len(problems) != 0 {
+		t.Fatalf("problems:\n%s", messages(problems))
+	}
+	if again.PublishedHash != ContentHash(again) {
+		t.Fatalf("freeze = %q, ContentHash = %q", again.PublishedHash, ContentHash(again))
+	}
+}
+
+func TestPlaceholderCriteria(t *testing.T) {
+	cases := []struct {
+		name     string
+		criteria string
+		want     []string // substrings of the messages, in any order
+		notWant  []string
+	}{
+		{"ellipsis template only", "- [ ] AC1: Given … When … Then …\n",
+			[]string{
+				"status ready requires at least one acceptance criterion without a placeholder",
+				`acceptance criterion "- [ ] AC1: Given … When … Then …" has a placeholder "…"`,
+			}, nil},
+		{"angle template only", "- [ ] Given <context>, when <action>, then <result>\n",
+			[]string{
+				"requires at least one acceptance criterion without a placeholder",
+				`acceptance criterion "- [ ] Given <context>, when <action>, then <result>" has a placeholder "<context>"`,
+			}, nil},
+		{"one real, one placeholder", "- [ ] AC1: Given x When y Then z\n- [ ] AC2: Given … When … Then …\n",
+			[]string{`acceptance criterion "- [ ] AC2: Given … When … Then …" has a placeholder "…"`},
+			[]string{"requires at least one", "AC1"}},
+		{"inline code isn't a placeholder", "- [ ] AC1: Given `List<T>` When `...` Then z\n",
+			nil, []string{"placeholder", "requires at least one"}},
+		{"fenced code in the section", "- [ ] AC1: Given x When y Then z\n```\n- [ ] ... <x>\n```\n",
+			nil, []string{"placeholder", "requires at least one"}},
+		{"no checkbox at all", "Nothing here.\n",
+			[]string{"status ready requires at least one acceptance criterion"},
+			[]string{"without a placeholder"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, eol := range []string{"\n", "\r\n"} {
+				text := strings.ReplaceAll(draftText(c.criteria), "\n", eol)
+				tk := parseText(t, text)
+				if err := tk.MarkReady(); err != nil {
+					t.Fatal(err)
+				}
+				got := messages(ValidateFile(tk))
+				noToolNames(t, got)
+				for _, w := range c.want {
+					if !strings.Contains(got, w) {
+						t.Fatalf("eol %q: messages =\n%s\nwant %q", eol, got, w)
+					}
+				}
+				for _, w := range c.notWant {
+					if strings.Contains(got, w) {
+						t.Fatalf("eol %q: messages =\n%s\ndon't want %q", eol, got, w)
+					}
+				}
+				if strings.Contains(got, "readied") {
+					t.Fatalf("eol %q: readiness problem: %s", eol, got)
+				}
+			}
+		})
+	}
+}
+
+func TestHasAcceptanceCriteriaIgnoresPlaceholders(t *testing.T) {
+	cases := map[string]bool{
+		"\n## Acceptance criteria\n- [ ] AC1: Given … When … Then …\n":                   false,
+		"\n## Acceptance criteria\n- [ ] AC1: Given x When y Then z\n":                   true,
+		"\n## Acceptance criteria\n- [ ] Given <context>\n- [x] AC2: done\n":             true,
+		"\n## Context\n- [ ] AC1: Given x When y Then z\n## Acceptance criteria\nnone\n": false,
+		"\n## Context\nGiven … <context>\n## Acceptance criteria\n- [ ] AC1: real\n":     true,
+		"\n## Acceptance criteria\n- [ ] AC1: real\n## Notes\n- [ ] … later\n":           true,
+		"\n## Acceptance criteria\n\n\n* [ ] AC1: star bullet\n":                         true,
+		"no heading\n- [ ] AC1: real\n":                                                  false,
+	}
+	for body, want := range cases {
+		if got := HasAcceptanceCriteria(body); got != want {
+			t.Errorf("HasAcceptanceCriteria(%q) = %v, want %v", body, got, want)
+		}
+	}
+}
+
+// QA: the criteria section ends at the next "## " heading.
+func TestQACriteriaSectionBounds(t *testing.T) {
+	cases := map[string]bool{
+		"\n## Acceptance criteria\nNone yet.\n## Notes\n- [ ] AC1: Given x When y Then z\n": false,
+		"\n## Acceptance criteria\n### Sub\n- [ ] AC1: real\n":                              true, // "###" isn't a section break
+		"\n## acceptance criteria\n- [ ] AC1: real\n":                                       true, // heading is case-insensitive
+		"\n### Acceptance criteria\n- [ ] AC1: real\n":                                      false,
+		"\n## Acceptance criteria  \n- [ ] AC1: real\n":                                     true, // trailing spaces
+	}
+	for body, want := range cases {
+		if got := HasAcceptanceCriteria(body); got != want {
+			t.Errorf("HasAcceptanceCriteria(%q) = %v, want %v", body, got, want)
+		}
+	}
+
+	// A placeholder checkbox after the section isn't reported.
+	text := strings.Replace(draftText("- [ ] AC1: Given x When y Then z\n"), "## Notes\nNone.\n", "## Notes\n- [ ] Given … later\n", 1)
+	tk := parseText(t, text)
+	if err := tk.MarkReady(); err != nil {
+		t.Fatal(err)
+	}
+	if got := messages(ValidateFile(tk)); strings.Contains(got, "placeholder") {
+		t.Fatalf("a checkbox outside the section was reported: %s", got)
+	}
+}
+
+// QA: for bodies without placeholders, HasAcceptanceCriteria agrees with the
+// v0.8.0 implementation, so the rewrite changes nothing but placeholders.
+func TestQAHasAcceptanceCriteriaMatchesV080WithoutPlaceholders(t *testing.T) {
+	v080 := func(body string) bool {
+		acceptanceRe := regexp.MustCompile(`(?im)^##\s+Acceptance criteria\s*$`)
+		checkboxRe := regexp.MustCompile(`(?m)^\s*[-*]\s+\[[ xX]\]\s+\S`)
+		headingRe := regexp.MustCompile(`(?m)^##\s`)
+		loc := acceptanceRe.FindStringIndex(body)
+		if loc == nil {
+			return false
+		}
+		section := body[loc[1]:]
+		if next := headingRe.FindStringIndex(section); next != nil {
+			section = section[:next[0]]
+		}
+		return checkboxRe.MatchString(section)
+	}
+	heads := []string{"## Acceptance criteria", "## acceptance criteria", "##  Acceptance criteria  ", "### Acceptance criteria", "## Acceptance"}
+	middles := []string{"", "\n", "\n\n", "\ntext\n", "\n## Next\n"}
+	items := []string{"- [ ] AC1: x", "* [x] AC1: x", "  - [X] AC1: x", "- [] AC1: x", "-[ ] AC1: x", "- [ ]", "1. [ ] AC1: x", "\t- [ ] AC1: x"}
+	tails := []string{"", "\n", "\n## Notes\n- [ ] AC9: y\n", "\n### Sub\n"}
+	n := 0
+	for _, eol := range []string{"\n", "\r\n"} {
+		for _, h := range heads {
+			for _, m := range middles {
+				for _, it := range items {
+					for _, tl := range tails {
+						body := strings.ReplaceAll("\n## Context\nwhy\n"+h+m+it+tl, "\n", eol)
+						n++
+						if it == "- [ ]" {
+							// v0.8.0's \s+\S could run past the end of the line, so
+							// an empty checkbox counted whenever text followed it.
+							// TestQAEmptyCheckboxIsNotACriterion pins the fix.
+							continue
+						}
+						if got, want := HasAcceptanceCriteria(body), v080(body); got != want {
+							t.Errorf("HasAcceptanceCriteria(%q) = %v, v0.8.0 said %v", body, got, want)
+						}
+					}
+				}
+			}
+		}
+	}
+	if n < 1000 {
+		t.Fatalf("only %d bodies checked", n)
+	}
+}
+
+// QA: an empty checkbox isn't a criterion, even with text on a later line. In
+// v0.8.0 it counted, because the checkbox pattern could cross the line end.
+func TestQAEmptyCheckboxIsNotACriterion(t *testing.T) {
+	for _, body := range []string{
+		"\n## Acceptance criteria\n- [ ]\n### Sub\n",
+		"\n## Acceptance criteria\n- [ ]\nsome text\n",
+		"\n## Acceptance criteria\n- [ ]   \r\nmore\r\n",
+	} {
+		if HasAcceptanceCriteria(body) {
+			t.Errorf("HasAcceptanceCriteria(%q) = true", body)
+		}
 	}
 }

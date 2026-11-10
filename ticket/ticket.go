@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/btdstudio/kiso/frontmatter"
+	"github.com/btdstudio/kiso/placeholder"
 )
 
 // Schema is the ticket format version.
@@ -73,6 +74,7 @@ type Ticket struct {
 	Status        string
 	External      map[string]string
 	PublishedHash string
+	ReadyHash     string // the readiness mark: ContentHash when MarkReady ran
 	Origin        Origin
 	Body          string
 	Path          string // where it was loaded from, if anywhere
@@ -103,6 +105,7 @@ func Parse(data []byte) (*Ticket, error) {
 		Status:        doc.Get("status"),
 		External:      doc.Map("external"),
 		PublishedHash: doc.Get("published_hash"),
+		ReadyHash:     doc.Get("ready_hash"),
 		Body:          doc.Body,
 		doc:           doc,
 	}
@@ -301,12 +304,22 @@ func (t *Ticket) Drift() (body, frontmatter bool) {
 	if !strings.HasPrefix(t.PublishedHash, v2Prefix) {
 		return Hash(t.Body) != t.PublishedHash, false
 	}
-	b, f, ok := parseV2(t.PublishedHash)
+	body, frontmatter, ok := compareV2(t.PublishedHash, t)
 	if !ok {
 		return true, true
 	}
+	return body, frontmatter
+}
+
+// compareV2 compares a stored "v2:" hash with the ticket's ContentHash, half by
+// half. ok is false when stored isn't a valid v2 hash.
+func compareV2(stored string, t *Ticket) (body, fm, ok bool) {
+	b, f, ok := parseV2(stored)
+	if !ok {
+		return false, false, false
+	}
 	nb, nf, _ := parseV2(ContentHash(t))
-	return nb != b, nf != f
+	return nb != b, nf != f, true
 }
 
 // Drifted reports whether a frozen ticket no longer matches what was published,
@@ -337,9 +350,47 @@ func driftMessage(body, fm bool) string {
 	}
 }
 
+// MarkReady sets the status to ready and records the readiness mark,
+// ready_hash, as the ticket's ContentHash. ValidateFile then requires the mark
+// to match, so a ticket set to ready by hand, or edited since, is reported. It
+// accepts a draft or ready ticket; on a ready one it refreshes the mark. It
+// doesn't check the criteria: ready a copy and run ValidateFile before writing.
+func (t *Ticket) MarkReady() error {
+	if t.Status != StatusDraft && t.Status != StatusReady {
+		return fmt.Errorf("ticket %s: only a draft or ready ticket can be readied, it's %s", t.ID, t.Status)
+	}
+	if err := t.doc.Set("status", StatusReady); err != nil {
+		return err
+	}
+	hash := ContentHash(t)
+	if err := t.doc.Set("ready_hash", hash); err != nil {
+		return err
+	}
+	t.Status = StatusReady
+	t.ReadyHash = hash
+	return nil
+}
+
+// readinessProblem checks a ready ticket's mark against its content, and
+// returns "" when it matches.
+func (t *Ticket) readinessProblem() string {
+	if t.ReadyHash == "" {
+		return "not readied through the CLI"
+	}
+	body, fm, ok := compareV2(t.ReadyHash, t)
+	if !ok {
+		return fmt.Sprintf("ready_hash %q isn't a valid v2 hash", t.ReadyHash)
+	}
+	if body || fm {
+		return driftMessage(body, fm) + " since readied"
+	}
+	return ""
+}
+
 // MarkPublished records a PM tool's item id, freezes the ticket with ContentHash
 // and sets the status. It refuses a drifted ticket, and a different id for a
-// tool on a frozen ticket. A legacy freeze is upgraded to "v2:".
+// tool on a frozen ticket. A legacy freeze is upgraded to "v2:". It removes the
+// readiness mark: once published, the freeze takes over.
 func (t *Ticket) MarkPublished(tool, itemID string) error {
 	if tool == "" || itemID == "" {
 		return fmt.Errorf("ticket %s: a tool and an item id are required", t.ID)
@@ -363,8 +414,10 @@ func (t *Ticket) MarkPublished(tool, itemID string) error {
 	if err := t.doc.Set("status", StatusPublished); err != nil {
 		return err
 	}
+	t.doc.Delete("ready_hash")
 	t.External = t.doc.Map("external")
 	t.PublishedHash = hash
+	t.ReadyHash = ""
 	t.Status = StatusPublished
 	return nil
 }
@@ -402,22 +455,63 @@ func (p Problem) String() string { return p.ID + ": " + p.Message }
 
 var idRe = regexp.MustCompile(`^([EFSTN])-(\d{4})$`)
 
-var acceptanceRe = regexp.MustCompile(`(?im)^##\s+Acceptance criteria\s*$`)
-var checkboxRe = regexp.MustCompile(`(?m)^\s*[-*]\s+\[[ xX]\]\s+\S`)
-var headingRe = regexp.MustCompile(`(?m)^##\s`)
+var acceptanceLineRe = regexp.MustCompile(`(?i)^##\s+Acceptance criteria\s*$`)
+var checkboxLineRe = regexp.MustCompile(`^\s*[-*]\s+\[[ xX]\]\s+\S`)
+var headingLineRe = regexp.MustCompile(`^##\s`)
+
+// flaggedCriterion is a checkbox line under "Acceptance criteria" that holds a
+// template placeholder, so it isn't a criterion.
+type flaggedCriterion struct {
+	Line        string // the line, trimmed
+	Placeholder string // the first placeholder on it
+}
+
+// criteria counts the checkbox lines under the body's "Acceptance criteria"
+// heading that are real criteria, and returns the ones that hold a placeholder.
+// Placeholders are found in the whole body at once, so code fences and comments
+// around the section are taken into account.
+func criteria(body string) (real int, flagged []flaggedCriterion) {
+	lines := strings.Split(body, "\n")
+	start := -1
+	for i, line := range lines {
+		if acceptanceLineRe.MatchString(strings.TrimSuffix(line, "\r")) {
+			start = i + 1
+			break
+		}
+	}
+	if start < 0 {
+		return 0, nil
+	}
+	first := map[int]string{} // 1-based line → its first placeholder
+	for _, m := range placeholder.Find(body) {
+		if _, seen := first[m.Line]; !seen {
+			first[m.Line] = m.Text
+		}
+	}
+	for i := start; i < len(lines); i++ {
+		line := strings.TrimSuffix(lines[i], "\r")
+		if headingLineRe.MatchString(line) {
+			break
+		}
+		if !checkboxLineRe.MatchString(line) {
+			continue
+		}
+		if p, ok := first[i+1]; ok {
+			flagged = append(flagged, flaggedCriterion{Line: strings.TrimSpace(line), Placeholder: p})
+		} else {
+			real++
+		}
+	}
+	return real, flagged
+}
 
 // HasAcceptanceCriteria reports whether the body lists at least one criterion
-// under its "Acceptance criteria" heading.
+// under its "Acceptance criteria" heading. A checkbox line that holds a
+// template placeholder, such as "Given … When … Then …" or "<context>",
+// doesn't count.
 func HasAcceptanceCriteria(body string) bool {
-	loc := acceptanceRe.FindStringIndex(body)
-	if loc == nil {
-		return false
-	}
-	section := body[loc[1]:]
-	if next := headingRe.FindStringIndex(section); next != nil {
-		section = section[:next[0]]
-	}
-	return checkboxRe.MatchString(section)
+	real, _ := criteria(body)
+	return real > 0
 }
 
 func sequence(id string) (int, bool) {
@@ -472,8 +566,19 @@ func ValidateFile(t *Ticket) []Problem {
 	switch t.Status {
 	case StatusDraft:
 	case StatusReady:
-		if !HasAcceptanceCriteria(t.Body) {
-			add("status ready requires at least one acceptance criterion")
+		real, flagged := criteria(t.Body)
+		if real == 0 {
+			if len(flagged) > 0 {
+				add("status ready requires at least one acceptance criterion without a placeholder")
+			} else {
+				add("status ready requires at least one acceptance criterion")
+			}
+		}
+		for _, c := range flagged {
+			add("acceptance criterion %q has a placeholder %q", c.Line, c.Placeholder)
+		}
+		if p := t.readinessProblem(); p != "" {
+			add("%s", p)
 		}
 	case StatusPublished:
 		if len(t.External) == 0 {
