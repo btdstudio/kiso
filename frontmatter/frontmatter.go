@@ -354,6 +354,50 @@ func (d *Document) Map(key string) map[string]string {
 	return out
 }
 
+// Kind is the shape of a top-level field's value.
+type Kind int
+
+const (
+	// Scalar is a single value: key: value.
+	Scalar Kind = iota
+	// List is an inline list: key: [a, b].
+	List
+	// Map is one level of nested keys, indented under the key.
+	Map
+)
+
+// Field is a read-only view of one top-level field. Quotes, escapes and
+// comments are already removed.
+type Field struct {
+	Key   string
+	Kind  Kind
+	Value string            // Scalar
+	Items []string          // List; a copy
+	Subs  map[string]string // Map; a copy
+}
+
+// Fields returns the top-level fields in file order. Changing the result
+// doesn't change the document.
+func (d *Document) Fields() []Field {
+	out := make([]Field, 0, len(d.fields))
+	for _, f := range d.fields {
+		field := Field{Key: f.key}
+		switch f.kind {
+		case scalar:
+			field.Kind, field.Value = Scalar, f.value
+		case list:
+			field.Kind, field.Items = List, append([]string{}, f.items...)
+		case nested:
+			field.Kind, field.Subs = Map, make(map[string]string, len(f.subs))
+			for _, s := range f.subs {
+				field.Subs[s.key] = s.value
+			}
+		}
+		out = append(out, field)
+	}
+	return out
+}
+
 // slot returns the field for a key, ready to overwrite, adding it at the end if
 // it's new.
 func (d *Document) slot(key string) (*field, error) {
