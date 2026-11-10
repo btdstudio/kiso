@@ -1,11 +1,13 @@
 // Package ticket is the contract between planning and execution: one markdown
 // file per ticket, with a schema both tools validate identically. Local until
-// published; then the PM tool owns it, and the file is a frozen snapshot.
+// published; then the PM tool owns it, and the file is a frozen snapshot. The
+// freeze covers the body and the frontmatter (see ContentHash).
 package ticket
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/btdstudio/kiso/frontmatter"
 )
@@ -168,7 +171,8 @@ func New(t Ticket) (*Ticket, error) {
 func (t *Ticket) Bytes() []byte { return t.doc.Bytes() }
 
 // Hash is the sha256 of a ticket body, with line endings normalized to LF and
-// exactly one trailing newline, so an editor or OS can't cause false drift.
+// exactly one trailing newline, so an editor or OS can't cause false drift. A
+// published_hash without the "v2:" prefix is this legacy body-only hash.
 func Hash(body string) string {
 	normalized := strings.ReplaceAll(body, "\r\n", "\n")
 	normalized = strings.TrimRight(normalized, "\n") + "\n"
@@ -176,21 +180,175 @@ func Hash(body string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// v2Prefix marks a ContentHash value.
+const v2Prefix = "v2:"
+
+// excludedKeys are the frontmatter keys written after a freeze, so they don't
+// count toward it. Every other key does, including keys the schema doesn't know.
+var excludedKeys = map[string]bool{
+	"external": true, "published_hash": true, "ready_hash": true, "status": true, "origin": true,
+}
+
+// ContentHash is the canonical hash of a ticket: "v2:<body>.<frontmatter>", each
+// half the first 32 hex characters of a sha256. The body is normalized as Hash
+// does. The frontmatter is every key except excludedKeys, sorted, one
+// key=<JSON value> per line, with list items sorted and empty values left out,
+// so formatting, order and absent optional fields don't change it.
+func ContentHash(t *Ticket) string {
+	sum := sha256.Sum256([]byte(canonicalFrontmatter(t.doc)))
+	return v2Prefix + Hash(t.Body)[:32] + "." + hex.EncodeToString(sum[:])[:32]
+}
+
+func canonicalFrontmatter(doc *frontmatter.Document) string {
+	fields := doc.Fields()
+	// Sort by key, not by rendered line: "a-b=" sorts before "a=", but "a"
+	// sorts before "a-b".
+	sort.Slice(fields, func(i, j int) bool { return fields[i].Key < fields[j].Key })
+	var b strings.Builder
+	for _, f := range fields {
+		if excludedKeys[f.Key] {
+			continue
+		}
+		var value any
+		switch f.Kind {
+		case frontmatter.Scalar:
+			if f.Value == "" {
+				continue
+			}
+			value = f.Value
+		case frontmatter.List:
+			if len(f.Items) == 0 {
+				continue
+			}
+			sort.Strings(f.Items)
+			value = f.Items
+		case frontmatter.Map:
+			for k, v := range f.Subs {
+				if v == "" {
+					delete(f.Subs, k)
+				}
+			}
+			if len(f.Subs) == 0 {
+				continue
+			}
+			value = f.Subs
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			panic(err) // strings, string slices and string maps always encode
+		}
+		b.WriteString(f.Key + "=" + string(encoded) + "\n")
+	}
+	return b.String()
+}
+
+// invalidUTF8Fields lists the frontmatter fields whose values aren't valid
+// UTF-8. ContentHash can't tell such values apart (JSON replaces each invalid
+// byte with U+FFFD), so ValidateFile refuses them.
+func invalidUTF8Fields(doc *frontmatter.Document) []string {
+	var keys []string
+	for _, f := range doc.Fields() {
+		valid := utf8.ValidString(f.Value)
+		for _, item := range f.Items {
+			valid = valid && utf8.ValidString(item)
+		}
+		for _, v := range f.Subs { // keys are ASCII: the parser checks them
+			valid = valid && utf8.ValidString(v)
+		}
+		if !valid {
+			keys = append(keys, f.Key)
+		}
+	}
+	return keys
+}
+
+// parseV2 splits a "v2:<32 hex>.<32 hex>" value into its halves.
+func parseV2(v string) (body, fm string, ok bool) {
+	rest, found := strings.CutPrefix(v, v2Prefix)
+	if !found {
+		return "", "", false
+	}
+	body, fm, found = strings.Cut(rest, ".")
+	if !found || !isHex32(body) || !isHex32(fm) {
+		return "", "", false
+	}
+	return body, fm, true
+}
+
+func isHex32(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !(s[i] >= '0' && s[i] <= '9' || s[i] >= 'a' && s[i] <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // Frozen reports whether the ticket is frozen: published and not unfrozen.
 func (t *Ticket) Frozen() bool { return t.PublishedHash != "" }
 
-// Drifted reports whether a frozen ticket's body no longer matches what was
-// published.
-func (t *Ticket) Drifted() bool { return t.Frozen() && Hash(t.Body) != t.PublishedHash }
+// Drift reports which parts of a frozen ticket changed since it was published.
+// A legacy published_hash (no "v2:" prefix) covers the body only, so its
+// frontmatter never drifts. A malformed "v2:" value drifts on both sides,
+// because neither can be verified.
+func (t *Ticket) Drift() (body, frontmatter bool) {
+	if !t.Frozen() {
+		return false, false
+	}
+	if !strings.HasPrefix(t.PublishedHash, v2Prefix) {
+		return Hash(t.Body) != t.PublishedHash, false
+	}
+	b, f, ok := parseV2(t.PublishedHash)
+	if !ok {
+		return true, true
+	}
+	nb, nf, _ := parseV2(ContentHash(t))
+	return nb != b, nf != f
+}
 
-// MarkPublished records a PM tool's item id, freezes the body and sets the status.
-// It refuses a drifted ticket, and a different id for a tool on a frozen ticket.
+// Drifted reports whether a frozen ticket no longer matches what was published,
+// in its body or its frontmatter.
+func (t *Ticket) Drifted() bool {
+	body, fm := t.Drift()
+	return body || fm
+}
+
+// malformedFreeze reports a "v2:" published_hash that isn't a valid v2 hash.
+func (t *Ticket) malformedFreeze() bool {
+	if !strings.HasPrefix(t.PublishedHash, v2Prefix) {
+		return false
+	}
+	_, _, ok := parseV2(t.PublishedHash)
+	return !ok
+}
+
+// driftMessage says what drifted: "body changed", "frontmatter changed" or both.
+func driftMessage(body, fm bool) string {
+	switch {
+	case body && fm:
+		return "body and frontmatter changed"
+	case fm:
+		return "frontmatter changed"
+	default:
+		return "body changed"
+	}
+}
+
+// MarkPublished records a PM tool's item id, freezes the ticket with ContentHash
+// and sets the status. It refuses a drifted ticket, and a different id for a
+// tool on a frozen ticket. A legacy freeze is upgraded to "v2:".
 func (t *Ticket) MarkPublished(tool, itemID string) error {
 	if tool == "" || itemID == "" {
 		return fmt.Errorf("ticket %s: a tool and an item id are required", t.ID)
 	}
-	if t.Drifted() {
-		return fmt.Errorf("ticket %s: body has changed since it was published — unfreeze it or write a superseding ticket", t.ID)
+	if t.malformedFreeze() {
+		return fmt.Errorf("ticket %s: published_hash %q isn't a valid v2 hash — unfreeze it to re-freeze", t.ID, t.PublishedHash)
+	}
+	if body, fm := t.Drift(); body || fm {
+		return fmt.Errorf("ticket %s: %s since it was published — unfreeze it or write a superseding ticket", t.ID, driftMessage(body, fm))
 	}
 	if existing := t.External[tool]; t.Frozen() && existing != "" && existing != itemID {
 		return fmt.Errorf("ticket %s: frozen with %s id %s, can't change it to %s", t.ID, tool, existing, itemID)
@@ -198,7 +356,7 @@ func (t *Ticket) MarkPublished(tool, itemID string) error {
 	if err := t.doc.SetSub("external", tool, itemID); err != nil {
 		return err
 	}
-	hash := Hash(t.Body)
+	hash := ContentHash(t)
 	if err := t.doc.Set("published_hash", hash); err != nil {
 		return err
 	}
@@ -336,8 +494,13 @@ func ValidateFile(t *Ticket) []Problem {
 	if t.PublishedHash != "" && len(t.External) == 0 {
 		add("published_hash requires an external id")
 	}
-	if t.Drifted() {
-		add("drifted: body has changed since it was published")
+	for _, key := range invalidUTF8Fields(t.doc) {
+		add("frontmatter field %s isn't valid UTF-8", key)
+	}
+	if t.malformedFreeze() {
+		add("published_hash %q isn't a valid v2 hash", t.PublishedHash)
+	} else if body, fm := t.Drift(); body || fm {
+		add("drifted: %s since it was published", driftMessage(body, fm))
 	}
 	return problems
 }
