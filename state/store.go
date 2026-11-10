@@ -51,6 +51,11 @@ type Store struct {
 	// Preflight runs before STATE.json is read, to refuse layouts the tool no
 	// longer supports. Optional.
 	Preflight func(root string) error
+	// Refresh runs after a transition saves STATE.json and before it records, so
+	// files it rewrites inside the change's folders go into the same commit.
+	// Optional. Advance and Reopen call it. An error is printed as a warning; it
+	// doesn't fail the transition.
+	Refresh func(root string, c Change) error
 }
 
 type stateFile struct {
@@ -414,13 +419,19 @@ func (s Store) active(root string) (Change, error) {
 	if _, err := os.Stat(s.ChangeDir(root, c.Name)); err != nil {
 		return Change{}, fmt.Errorf("%s: active change %q has no folder under %s/ — run `%s switch <change>`", s.tool(), c.Name, s.SpecsDir, s.tool())
 	}
+	// The pointer is a plain file, so hold it to the same rules as Switch: a name
+	// that can't escape the specs folder, and a real folder, not a symlink.
+	if err := s.checkFolder(root, c.Name); err != nil {
+		return Change{}, fmt.Errorf("%s: active change %q isn't a valid change folder — run `%s switch <change>`", s.tool(), c.Name, s.tool())
+	}
 	return c, nil
 }
 
-// Advance sets a gate on the active change, logs it along with any notes, and
-// commits, including the change's folder, so an approval can't be recorded while
-// the document it approved stays uncommitted. Enforcing the loop order is the caller's job, through CheckGate, since
-// whether a violation blocks is its policy.
+// Advance sets a gate on the active change, runs Refresh, logs it along with any
+// notes, and commits, including the change's folders, so an approval can't be
+// recorded while the document it approved stays uncommitted. Enforcing the loop
+// order is the caller's job, through CheckGate, since whether a violation blocks
+// is its policy.
 func (s Store) Advance(root, phase, status, reason string, notes ...string) (Change, error) {
 	c, err := s.active(root)
 	if err != nil {
@@ -436,16 +447,12 @@ func (s Store) Advance(root, phase, status, reason string, notes ...string) (Cha
 	for _, note := range notes {
 		lines = append(lines, c.Name+": "+note)
 	}
-	paths := []string{filepath.ToSlash(filepath.Join(s.SpecsDir, c.Name))}
-	for _, dir := range s.ChangeDirs {
-		if _, err := os.Stat(filepath.Join(root, dir, c.Name)); err == nil {
-			paths = append(paths, filepath.ToSlash(filepath.Join(dir, c.Name)))
-		}
-	}
-	return c, s.Record(root, lines, paths...)
+	s.refresh(root, c)
+	return c, s.Record(root, lines, s.changePaths(root, c)...)
 }
 
-// Reopen moves the active change back to a phase, logs it and commits.
+// Reopen moves the active change back to a phase, runs Refresh, logs it and
+// commits, including the change's folders, as Advance does.
 func (s Store) Reopen(root, phase, reason string) (Change, error) {
 	c, err := s.active(root)
 	if err != nil {
@@ -457,7 +464,30 @@ func (s Store) Reopen(root, phase, reason string) (Change, error) {
 	if err := s.Save(root, &c); err != nil {
 		return Change{}, err
 	}
-	return c, s.Record(root, []string{c.Name + ": reopened " + phase + " (" + reason + ")"})
+	s.refresh(root, c)
+	return c, s.Record(root, []string{c.Name + ": reopened " + phase + " (" + reason + ")"}, s.changePaths(root, c)...)
+}
+
+// changePaths lists a change's folders, relative to root: its folder under
+// SpecsDir, and <dir>/<change> for each ChangeDirs entry that exists.
+func (s Store) changePaths(root string, c Change) []string {
+	paths := []string{filepath.ToSlash(filepath.Join(s.SpecsDir, c.Name))}
+	for _, dir := range s.ChangeDirs {
+		if _, err := os.Stat(filepath.Join(root, dir, c.Name)); err == nil {
+			paths = append(paths, filepath.ToSlash(filepath.Join(dir, c.Name)))
+		}
+	}
+	return paths
+}
+
+// refresh runs Refresh, if it's set, and turns an error into a warning.
+func (s Store) refresh(root string, c Change) {
+	if s.Refresh == nil {
+		return
+	}
+	if err := s.Refresh(root, c); err != nil {
+		fmt.Fprintf(s.warn(), "warning: %v\n", err)
+	}
 }
 
 // CloseChange closes a change by name, logs it and commits. Closing the active
