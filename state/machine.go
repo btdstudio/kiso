@@ -51,6 +51,7 @@ type Change struct {
 	Phase     string            `json:"phase"`
 	Status    string            `json:"status"`
 	Gates     map[string]string `json:"gates"`
+	Reasons   map[string]string `json:"reasons,omitempty"` // why each skipped phase was skipped
 	Sources   []string          `json:"sources"`
 	Repos     []string          `json:"repos,omitempty"` // logical names from REPOS.json
 	UpdatedAt string            `json:"updatedAt"`       // per change, so branches touching different changes merge
@@ -93,6 +94,25 @@ func withGate(gates map[string]string, phase, status string) map[string]string {
 		delete(out, phase)
 	} else {
 		out[phase] = status
+	}
+	return out
+}
+
+// withReason returns a copy of reasons with phase set to reason, like withGate.
+// "" removes the entry, and an empty result is nil, so a change with no skips
+// writes no reasons.
+func withReason(reasons map[string]string, phase, reason string) map[string]string {
+	out := make(map[string]string, len(reasons)+1)
+	for k, v := range reasons {
+		out[k] = v
+	}
+	if reason == "" {
+		delete(out, phase)
+	} else {
+		out[phase] = reason
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
@@ -147,6 +167,11 @@ func (m Machine) SetGate(c *Change, phase, status, reason string) error {
 	c.Phase = phase
 	c.Status = status
 	c.Gates = withGate(c.Gates, phase, status)
+	kept := ""
+	if status == Skipped {
+		kept = reason
+	}
+	c.Reasons = withReason(c.Reasons, phase, kept)
 	return nil
 }
 
@@ -180,6 +205,9 @@ func (m Machine) Reopen(c *Change, phase, reason string) error {
 	c.Phase = phase
 	c.Status = status
 	c.Gates = gates
+	// The reopened phase is no longer skipped; later phases that stay skipped
+	// keep their reasons.
+	c.Reasons = withReason(c.Reasons, phase, "")
 	return nil
 }
 
