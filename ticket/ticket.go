@@ -69,6 +69,7 @@ type Ticket struct {
 	Change        string
 	Spec          string
 	ADRs          []string
+	Requirements  []string // ids from the change's spec; kiso doesn't check them
 	Labels        []string
 	Estimate      string
 	Status        string
@@ -100,6 +101,7 @@ func Parse(data []byte) (*Ticket, error) {
 		Change:        doc.Get("change"),
 		Spec:          doc.Get("spec"),
 		ADRs:          doc.List("adrs"),
+		Requirements:  doc.List("requirements"),
 		Labels:        doc.List("labels"),
 		Estimate:      doc.Get("estimate"),
 		Status:        doc.Get("status"),
@@ -151,6 +153,12 @@ func New(t Ticket) (*Ticket, error) {
 	}
 	if err := doc.SetList("adrs", t.ADRs); err != nil {
 		return nil, err
+	}
+	// Optional, so it's written only when there's something to cite.
+	if len(t.Requirements) > 0 {
+		if err := doc.SetList("requirements", t.Requirements); err != nil {
+			return nil, err
+		}
 	}
 	if err := doc.SetList("labels", t.Labels); err != nil {
 		return nil, err
