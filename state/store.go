@@ -151,11 +151,12 @@ var slugNonAlnum = regexp.MustCompile(`[^a-z0-9]+`)
 // <id>-<slug>.
 func Slugify(text string) string {
 	slug := slugNonAlnum.ReplaceAllString(strings.ToLower(text), "-")
-	slug = strings.Trim(slug, "-")
-	if r := []rune(slug); len(r) > 40 {
+	if r := []rune(strings.Trim(slug, "-")); len(r) > 40 {
 		slug = string(r[:40])
 	}
-	return slug
+	// Trim after cutting too: a cut just past a "-" would leave a trailing one,
+	// which isn't a valid change name.
+	return strings.Trim(slug, "-")
 }
 
 // NewChange returns an empty change.
