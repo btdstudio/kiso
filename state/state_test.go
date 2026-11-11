@@ -687,7 +687,9 @@ func TestFailedCommitIsAnErrorButStateStands(t *testing.T) {
 }
 
 func TestSlugifyAndNextID(t *testing.T) {
-	for in, want := range map[string]string{"Auth Flow!": "auth-flow", "  ": "", "Refactor DB layer": "refactor-db-layer"} {
+	for in, want := range map[string]string{"Auth Flow!": "auth-flow", "  ": "", "Refactor DB layer": "refactor-db-layer",
+		// The 40-character cut lands just after a "-".
+		"Bump kiso to v0.9.0 and release tomo v0.11.0": "bump-kiso-to-v0-9-0-and-release-tomo-v0"} {
 		if got := Slugify(in); got != want {
 			t.Errorf("Slugify(%q) = %q, want %q", in, got, want)
 		}
