@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -120,6 +121,61 @@ func TestNextIDRefusesUnreadableSpecs(t *testing.T) {
 	}
 	if id, err := s.NextID(root); err == nil || !strings.Contains(err.Error(), "cannot read") || id != 0 {
 		t.Fatalf("NextID = %d, %v; want a cannot read error", id, err)
+	}
+}
+
+func TestSeedRefusesRecordedName(t *testing.T) {
+	root, s := t.TempDir(), store()
+	if _, err := s.Seed(root, "2-beta", SeedOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Advance(root, "intake", Approved, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CloseChange(root, "2-beta", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(s.ChangeDir(root, "2-beta")); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := os.ReadFile(s.StatePath(root))
+	log, _ := os.ReadFile(s.LogPath(root))
+
+	_, err := s.Seed(root, "2-beta", SeedOptions{})
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("err = %v", err)
+	}
+	if got, _ := os.ReadFile(s.StatePath(root)); !bytes.Equal(got, state) {
+		t.Errorf("STATE.json changed:\n%s", got)
+	}
+	if got, _ := os.ReadFile(s.LogPath(root)); !bytes.Equal(got, log) {
+		t.Errorf("LOG.md changed:\n%s", got)
+	}
+	if _, err := os.Stat(s.ChangeDir(root, "2-beta")); !os.IsNotExist(err) {
+		t.Errorf("refused seed created the folder: %v", err)
+	}
+	changes, err := s.ReadChanges(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := changes["2-beta"]; c == nil || c.Status != Closed || c.Gates["intake"] != Approved {
+		t.Fatalf("record = %+v", c)
+	}
+}
+
+func TestSeedWritesNothingOnBadState(t *testing.T) {
+	root, s := t.TempDir(), store()
+	if err := os.WriteFile(s.StatePath(root), []byte(`{"changes":{`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Seed(root, "1-x", SeedOptions{}); err == nil {
+		t.Fatal("seed must fail on corrupt state")
+	}
+	if _, err := os.Stat(s.SpecsPath(root)); !os.IsNotExist(err) {
+		t.Errorf("refused seed created the specs folder: %v", err)
+	}
+	if _, err := os.Stat(s.LogPath(root)); !os.IsNotExist(err) {
+		t.Errorf("refused seed wrote LOG.md: %v", err)
 	}
 }
 

@@ -367,7 +367,8 @@ type SeedOptions struct {
 }
 
 // Seed creates a change folder and records its initial machine (the first phase
-// at draft), making it the active change.
+// at draft), making it the active change. It refuses a name STATE.json already
+// records.
 func (s Store) Seed(root, name string, opts SeedOptions) (Change, error) {
 	if !changeNameRe.MatchString(name) {
 		return Change{}, fmt.Errorf("%s: invalid change name %q", s.tool(), name)
@@ -377,6 +378,15 @@ func (s Store) Seed(root, name string, opts SeedOptions) (Change, error) {
 	}
 	if len(s.Machine.Phases) == 0 {
 		return Change{}, fmt.Errorf("%s: machine has no phases", s.tool())
+	}
+	// Check before writing anything: Save would replace an existing record, and
+	// a refused seed must leave no folder behind.
+	changes, err := s.ReadChanges(root)
+	if err != nil {
+		return Change{}, err
+	}
+	if _, ok := changes[name]; ok {
+		return Change{}, fmt.Errorf("%s: change %q already exists in %s", s.tool(), name, s.StatePath(root))
 	}
 	c := NewChange(name)
 	if opts.Sources != nil {
