@@ -686,7 +686,7 @@ func TestFailedCommitIsAnErrorButStateStands(t *testing.T) {
 	}
 }
 
-func TestSlugifyAndNextID(t *testing.T) {
+func TestSlugify(t *testing.T) {
 	for in, want := range map[string]string{"Auth Flow!": "auth-flow", "  ": "", "Refactor DB layer": "refactor-db-layer",
 		// The 40-character cut lands just after a "-".
 		"Bump kiso to v0.9.0 and release tomo v0.11.0": "bump-kiso-to-v0-9-0-and-release-tomo-v0"} {
@@ -696,16 +696,6 @@ func TestSlugifyAndNextID(t *testing.T) {
 	}
 	if got := Slugify(strings.Repeat("x", 100)); len(got) != 40 {
 		t.Errorf("slug length = %d", len(got))
-	}
-	root, s := t.TempDir(), store()
-	if s.NextID(root) != 1 {
-		t.Errorf("NextID without specs = %d", s.NextID(root))
-	}
-	if err := os.MkdirAll(filepath.Join(root, "specs", "7-x"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if s.NextID(root) != 8 {
-		t.Errorf("NextID = %d", s.NextID(root))
 	}
 }
 

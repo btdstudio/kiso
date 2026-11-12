@@ -128,21 +128,38 @@ var changeIDRe = regexp.MustCompile(`^(\d+)-`)
 var changeNameRe = regexp.MustCompile(`^(\d+)-[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
 // NextID is the next sequential change id: the highest numeric `<id>-` prefix
-// under the specs folder, plus one.
-func (s Store) NextID(root string) int {
-	entries, err := os.ReadDir(s.SpecsPath(root))
+// among the change folders and the changes recorded in STATE.json, plus one.
+// Errors from reading either are returned, never treated as empty: a record
+// whose folder is gone must still keep its id from being reused.
+func (s Store) NextID(root string) (int, error) {
+	changes, err := s.ReadChanges(root)
 	if err != nil {
-		return 1
+		return 0, err
 	}
 	max := 0
+	for name := range changes {
+		max = maxID(max, name)
+	}
+	dir := s.SpecsPath(root)
+	entries, err := os.ReadDir(dir)
+	if err != nil && !os.IsNotExist(err) {
+		return 0, fmt.Errorf("%s: cannot read %s: %v", s.tool(), dir, err)
+	}
 	for _, e := range entries {
-		if m := changeIDRe.FindStringSubmatch(e.Name()); m != nil {
-			if n, err := strconv.Atoi(m[1]); err == nil && n > max {
-				max = n
-			}
+		max = maxID(max, e.Name())
+	}
+	return max + 1, nil
+}
+
+// maxID is the higher of max and name's `<id>-` prefix. A name without one
+// leaves max as is.
+func maxID(max int, name string) int {
+	if m := changeIDRe.FindStringSubmatch(name); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > max {
+			return n
 		}
 	}
-	return max + 1
+	return max
 }
 
 var slugNonAlnum = regexp.MustCompile(`[^a-z0-9]+`)
